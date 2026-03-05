@@ -356,6 +356,21 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             }
         }
 
+        final String topP = request.getExtraParam("top_p");
+        if (topP != null) {
+            body.put("top_p", Double.parseDouble(topP));
+        }
+
+        final String frequencyPenalty = request.getExtraParam("frequency_penalty");
+        if (frequencyPenalty != null) {
+            body.put("frequency_penalty", Double.parseDouble(frequencyPenalty));
+        }
+
+        final String presencePenalty = request.getExtraParam("presence_penalty");
+        if (presencePenalty != null) {
+            body.put("presence_penalty", Double.parseDouble(presencePenalty));
+        }
+
         return body;
     }
 
@@ -381,7 +396,8 @@ public class OpenAiLlmClient extends AbstractLlmClient {
 
     /**
      * Determines whether the given model supports the "temperature" parameter.
-     * Some newer models (e.g., gpt-5-mini) only support the default temperature value.
+     * Reasoning models (o1, o3, o4, gpt-5 series) do not support custom temperature values.
+     * Only the default value (1) is accepted by these models.
      *
      * @param model the model name
      * @return true if the model supports custom temperature values
@@ -530,7 +546,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
 
     @Override
     protected int getTimeout() {
-        return Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.timeout", "60000"));
+        return Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.timeout", "120000"));
     }
 
     @Override
@@ -541,10 +557,91 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     @Override
     protected void applyPromptTypeParams(final LlmChatRequest request, final String promptType) {
         super.applyPromptTypeParams(request, promptType);
+        final String configPrefix = getConfigPrefix();
         final String reasoningEffort =
-                ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + "." + promptType + ".reasoning.effort", null);
+                ComponentUtil.getFessConfig().getOrDefault(configPrefix + "." + promptType + ".reasoning.effort", null);
         if (reasoningEffort != null) {
             request.putExtraParam("reasoning_effort", reasoningEffort);
+        }
+        final String topP = ComponentUtil.getFessConfig().getOrDefault(configPrefix + "." + promptType + ".top.p", null);
+        if (topP != null) {
+            request.putExtraParam("top_p", topP);
+        }
+        final String frequencyPenalty =
+                ComponentUtil.getFessConfig().getOrDefault(configPrefix + "." + promptType + ".frequency.penalty", null);
+        if (frequencyPenalty != null) {
+            request.putExtraParam("frequency_penalty", frequencyPenalty);
+        }
+        final String presencePenalty =
+                ComponentUtil.getFessConfig().getOrDefault(configPrefix + "." + promptType + ".presence.penalty", null);
+        if (presencePenalty != null) {
+            request.putExtraParam("presence_penalty", presencePenalty);
+        }
+        applyDefaultParams(request, promptType);
+    }
+
+    /**
+     * Applies default generation parameters based on prompt type.
+     * Only sets defaults when user has not configured the parameter.
+     *
+     * @param request the LLM chat request
+     * @param promptType the prompt type (e.g. "intent", "evaluation", "answer")
+     */
+    protected void applyDefaultParams(final LlmChatRequest request, final String promptType) {
+        switch (promptType) {
+        case "intent":
+        case "evaluation":
+            if (request.getTemperature() == null) {
+                request.setTemperature(0.1);
+            }
+            if (request.getMaxTokens() == null) {
+                request.setMaxTokens(256);
+            }
+            break;
+        case "unclear":
+        case "noresults":
+            if (request.getTemperature() == null) {
+                request.setTemperature(0.7);
+            }
+            if (request.getMaxTokens() == null) {
+                request.setMaxTokens(512);
+            }
+            break;
+        case "docnotfound":
+            if (request.getTemperature() == null) {
+                request.setTemperature(0.7);
+            }
+            if (request.getMaxTokens() == null) {
+                request.setMaxTokens(256);
+            }
+            break;
+        case "direct":
+        case "faq":
+            if (request.getTemperature() == null) {
+                request.setTemperature(0.7);
+            }
+            if (request.getMaxTokens() == null) {
+                request.setMaxTokens(1024);
+            }
+            break;
+        case "answer":
+            if (request.getTemperature() == null) {
+                request.setTemperature(0.5);
+            }
+            if (request.getMaxTokens() == null) {
+                request.setMaxTokens(2048);
+            }
+            break;
+        case "summary":
+            if (request.getTemperature() == null) {
+                request.setTemperature(0.3);
+            }
+            if (request.getMaxTokens() == null) {
+                request.setMaxTokens(2048);
+            }
+            break;
+        default:
+            break;
         }
     }
 
@@ -565,7 +662,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
 
     @Override
     protected int getContextMaxChars() {
-        return Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.chat.context.max.chars", "4000"));
+        return Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.chat.context.max.chars", "8000"));
     }
 
     @Override
