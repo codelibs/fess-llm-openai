@@ -1584,6 +1584,174 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertFalse(body2.containsKey("max_completion_tokens"));
     }
 
+    // ========== applyDefaultParams tests ==========
+
+    @Test
+    public void test_applyDefaultParams_intent() {
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "intent");
+        assertEquals(0.1, request.getTemperature());
+        assertEquals(Integer.valueOf(256), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_evaluation() {
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "evaluation");
+        assertEquals(0.1, request.getTemperature());
+        assertEquals(Integer.valueOf(256), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_unclear() {
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "unclear");
+        assertEquals(0.7, request.getTemperature());
+        assertEquals(Integer.valueOf(512), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_noresults() {
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "noresults");
+        assertEquals(0.7, request.getTemperature());
+        assertEquals(Integer.valueOf(512), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_docnotfound() {
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "docnotfound");
+        assertEquals(0.7, request.getTemperature());
+        assertEquals(Integer.valueOf(256), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_direct() {
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "direct");
+        assertEquals(0.7, request.getTemperature());
+        assertEquals(Integer.valueOf(1024), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_faq() {
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "faq");
+        assertEquals(0.7, request.getTemperature());
+        assertEquals(Integer.valueOf(1024), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_answer() {
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "answer");
+        assertEquals(0.5, request.getTemperature());
+        assertEquals(Integer.valueOf(2048), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_summary() {
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "summary");
+        assertEquals(0.3, request.getTemperature());
+        assertEquals(Integer.valueOf(2048), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_unknownType() {
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "unknown");
+        assertNull(request.getTemperature());
+        assertNull(request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_doesNotOverrideExisting() {
+        final LlmChatRequest request = new LlmChatRequest();
+        request.setTemperature(0.9);
+        request.setMaxTokens(100);
+        client.applyDefaultParams(request, "intent");
+        assertEquals(0.9, request.getTemperature());
+        assertEquals(Integer.valueOf(100), request.getMaxTokens());
+    }
+
+    // ========== buildRequestBody: top_p, frequency_penalty, presence_penalty tests ==========
+
+    @Test
+    public void test_buildRequestBody_withTopP() {
+        client.setTestModel("gpt-4o");
+        client.setTestTemperature(0.7);
+        client.setTestMaxTokens(4096);
+
+        final LlmChatRequest request = new LlmChatRequest().putExtraParam("top_p", "0.9").addUserMessage("Hello");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+
+        assertEquals(0.9, body.get("top_p"));
+    }
+
+    @Test
+    public void test_buildRequestBody_withFrequencyPenalty() {
+        client.setTestModel("gpt-4o");
+        client.setTestTemperature(0.7);
+        client.setTestMaxTokens(4096);
+
+        final LlmChatRequest request = new LlmChatRequest().putExtraParam("frequency_penalty", "0.5").addUserMessage("Hello");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+
+        assertEquals(0.5, body.get("frequency_penalty"));
+    }
+
+    @Test
+    public void test_buildRequestBody_withPresencePenalty() {
+        client.setTestModel("gpt-4o");
+        client.setTestTemperature(0.7);
+        client.setTestMaxTokens(4096);
+
+        final LlmChatRequest request = new LlmChatRequest().putExtraParam("presence_penalty", "0.3").addUserMessage("Hello");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+
+        assertEquals(0.3, body.get("presence_penalty"));
+    }
+
+    @Test
+    public void test_buildRequestBody_withAllExtraParams() {
+        client.setTestModel("gpt-5-mini");
+        client.setTestTemperature(0.7);
+        client.setTestMaxTokens(4096);
+
+        final LlmChatRequest request = new LlmChatRequest().putExtraParam("reasoning_effort", "low")
+                .putExtraParam("top_p", "0.95")
+                .putExtraParam("frequency_penalty", "0.2")
+                .putExtraParam("presence_penalty", "0.1")
+                .addUserMessage("Hello");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+
+        assertEquals("low", body.get("reasoning_effort"));
+        assertEquals(0.95, body.get("top_p"));
+        assertEquals(0.2, body.get("frequency_penalty"));
+        assertEquals(0.1, body.get("presence_penalty"));
+    }
+
+    @Test
+    public void test_buildRequestBody_withoutExtraParams() {
+        client.setTestModel("gpt-4o");
+        client.setTestTemperature(0.7);
+        client.setTestMaxTokens(4096);
+
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+
+        assertNull(body.get("top_p"));
+        assertNull(body.get("frequency_penalty"));
+        assertNull(body.get("presence_penalty"));
+    }
+
     // ========== Helper methods ==========
 
     private void setupClientForMockServer() {
