@@ -213,7 +213,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             throw e;
         } catch (final Exception e) {
             logger.warn("Failed to call OpenAI API. url={}, error={}", url, e.getMessage(), e);
-            throw new LlmException("Failed to call OpenAI API", e);
+            throw new LlmException("Failed to call OpenAI API", LlmException.ERROR_CONNECTION, e);
         }
     }
 
@@ -282,8 +282,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                             final JsonNode jsonNode = objectMapper.readTree(data);
                             if (jsonNode.has("choices") && jsonNode.get("choices").isArray() && jsonNode.get("choices").size() > 0) {
                                 final JsonNode firstChoice = jsonNode.get("choices").get(0);
-                                final boolean done = firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull()
-                                        && !"null".equals(firstChoice.get("finish_reason").asText());
+                                final boolean done = firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull();
 
                                 if (firstChoice.has("delta") && firstChoice.get("delta").has("content")) {
                                     final String content = firstChoice.get("delta").get("content").asText();
@@ -313,7 +312,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             throw e;
         } catch (final IOException e) {
             logger.warn("Failed to stream from OpenAI API. url={}, error={}", url, e.getMessage(), e);
-            final LlmException llmException = new LlmException("Failed to stream from OpenAI API", e);
+            final LlmException llmException = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
             callback.onError(llmException);
             throw llmException;
         }
@@ -358,17 +357,29 @@ public class OpenAiLlmClient extends AbstractLlmClient {
 
         final String topP = request.getExtraParam("top_p");
         if (topP != null) {
-            body.put("top_p", Double.parseDouble(topP));
+            try {
+                body.put("top_p", Double.parseDouble(topP));
+            } catch (final NumberFormatException e) {
+                logger.warn("[LLM:OPENAI] Invalid top_p value: {}", topP);
+            }
         }
 
         final String frequencyPenalty = request.getExtraParam("frequency_penalty");
         if (frequencyPenalty != null) {
-            body.put("frequency_penalty", Double.parseDouble(frequencyPenalty));
+            try {
+                body.put("frequency_penalty", Double.parseDouble(frequencyPenalty));
+            } catch (final NumberFormatException e) {
+                logger.warn("[LLM:OPENAI] Invalid frequency_penalty value: {}", frequencyPenalty);
+            }
         }
 
         final String presencePenalty = request.getExtraParam("presence_penalty");
         if (presencePenalty != null) {
-            body.put("presence_penalty", Double.parseDouble(presencePenalty));
+            try {
+                body.put("presence_penalty", Double.parseDouble(presencePenalty));
+            } catch (final NumberFormatException e) {
+                logger.warn("[LLM:OPENAI] Invalid presence_penalty value: {}", presencePenalty);
+            }
         }
 
         return body;
@@ -506,19 +517,6 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * @param directAnswerSystemPrompt the direct answer system prompt */
     public void setDirectAnswerSystemPrompt(final String directAnswerSystemPrompt) {
         this.directAnswerSystemPrompt = directAnswerSystemPrompt;
-    }
-
-    private String resolveErrorCode(final int statusCode) {
-        if (statusCode == 429) {
-            return LlmException.ERROR_RATE_LIMIT;
-        }
-        if (statusCode == 401 || statusCode == 403) {
-            return LlmException.ERROR_AUTH;
-        }
-        if (statusCode == 502 || statusCode == 503) {
-            return LlmException.ERROR_SERVICE_UNAVAILABLE;
-        }
-        return LlmException.ERROR_UNKNOWN;
     }
 
     /**
@@ -662,17 +660,34 @@ public class OpenAiLlmClient extends AbstractLlmClient {
 
     @Override
     protected int getContextMaxChars() {
-        return Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.chat.context.max.chars", "8000"));
+        final int value = Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.chat.context.max.chars", "8000"));
+        if (value <= 0) {
+            logger.warn("Invalid context max chars: {}. Using default: 8000", value);
+            return 8000;
+        }
+        return value;
     }
 
     @Override
     protected int getEvaluationMaxRelevantDocs() {
-        return Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.chat.evaluation.max.relevant.docs", "3"));
+        final int value =
+                Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.chat.evaluation.max.relevant.docs", "3"));
+        if (value <= 0) {
+            logger.warn("Invalid evaluation max relevant docs: {}. Using default: 3", value);
+            return 3;
+        }
+        return value;
     }
 
     @Override
     protected int getEvaluationDescriptionMaxChars() {
-        return Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.chat.evaluation.description.max.chars", "500"));
+        final int value =
+                Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.chat.evaluation.description.max.chars", "500"));
+        if (value <= 0) {
+            logger.warn("Invalid evaluation description max chars: {}. Using default: 500", value);
+            return 500;
+        }
+        return value;
     }
 
     @Override
