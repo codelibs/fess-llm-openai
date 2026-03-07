@@ -659,13 +659,26 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     }
 
     @Override
-    protected int getContextMaxChars() {
-        final int value = Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.chat.context.max.chars", "8000"));
-        if (value <= 0) {
-            logger.warn("Invalid context max chars: {}. Using default: 8000", value);
-            return 8000;
+    protected int getContextMaxChars(final String promptType) {
+        final String key = "rag.llm.openai." + promptType + ".context.max.chars";
+        final String configValue = ComponentUtil.getFessConfig().getOrDefault(key, null);
+        if (configValue != null) {
+            final int value = Integer.parseInt(configValue);
+            if (value > 0) {
+                return value;
+            }
+            logger.warn("Invalid context max chars for promptType={}: {}. Using default.", promptType, value);
         }
-        return value;
+        switch (promptType) {
+        case "answer":
+            return 16000;
+        case "summary":
+            return 16000;
+        case "faq":
+            return 10000;
+        default:
+            return 10000;
+        }
     }
 
     @Override
