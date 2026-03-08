@@ -581,11 +581,15 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     /**
      * Applies default generation parameters based on prompt type.
      * Only sets defaults when user has not configured the parameter.
+     * For reasoning models, multiplies the default max tokens to account for
+     * internal reasoning token consumption, and sets reasoning_effort to "low"
+     * for simple classification tasks.
      *
      * @param request the LLM chat request
      * @param promptType the prompt type (e.g. "intent", "evaluation", "answer")
      */
     protected void applyDefaultParams(final LlmChatRequest request, final String promptType) {
+        final boolean maxTokensSetByUser = request.getMaxTokens() != null;
         switch (promptType) {
         case "intent":
         case "evaluation":
@@ -641,6 +645,49 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         default:
             break;
         }
+
+        // For reasoning models, apply token multiplier and default reasoning_effort
+        final String model = getModel();
+        if (isReasoningModel(model)) {
+            // Multiply default max tokens if not explicitly set by user
+            if (!maxTokensSetByUser && request.getMaxTokens() != null) {
+                final int multiplier = getReasoningTokenMultiplier();
+                request.setMaxTokens(request.getMaxTokens() * multiplier);
+                if (logger.isDebugEnabled()) {
+                    logger.debug("[LLM:OPENAI] Applied reasoning token multiplier. promptType={}, maxTokens={}, multiplier={}", promptType,
+                            request.getMaxTokens(), multiplier);
+                }
+            }
+
+            // Set default reasoning_effort for simple tasks
+            if (request.getExtraParam("reasoning_effort") == null) {
+                switch (promptType) {
+                case "intent":
+                case "evaluation":
+                case "docnotfound":
+                case "unclear":
+                case "noresults":
+                    request.putExtraParam("reasoning_effort", "low");
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("[LLM:OPENAI] Applied default reasoning_effort=low. promptType={}", promptType);
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+    }
+
+    /**
+     * Gets the reasoning token multiplier for reasoning models.
+     * Reasoning models consume part of max_completion_tokens for internal reasoning,
+     * so default token limits need to be increased to ensure sufficient output tokens.
+     *
+     * @return the multiplier (default: 4)
+     */
+    protected int getReasoningTokenMultiplier() {
+        return Integer.parseInt(ComponentUtil.getFessConfig().getOrDefault("rag.llm.openai.reasoning.token.multiplier", "4"));
     }
 
     @Override
