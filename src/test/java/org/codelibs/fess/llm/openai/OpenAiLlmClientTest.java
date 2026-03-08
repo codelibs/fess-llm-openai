@@ -1588,6 +1588,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_applyDefaultParams_intent() {
+        client.setTestModel("gpt-4o");
         final LlmChatRequest request = new LlmChatRequest();
         client.applyDefaultParams(request, "intent");
         assertEquals(0.1, request.getTemperature());
@@ -1596,6 +1597,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_applyDefaultParams_evaluation() {
+        client.setTestModel("gpt-4o");
         final LlmChatRequest request = new LlmChatRequest();
         client.applyDefaultParams(request, "evaluation");
         assertEquals(0.1, request.getTemperature());
@@ -1604,6 +1606,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_applyDefaultParams_unclear() {
+        client.setTestModel("gpt-4o");
         final LlmChatRequest request = new LlmChatRequest();
         client.applyDefaultParams(request, "unclear");
         assertEquals(0.7, request.getTemperature());
@@ -1612,6 +1615,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_applyDefaultParams_noresults() {
+        client.setTestModel("gpt-4o");
         final LlmChatRequest request = new LlmChatRequest();
         client.applyDefaultParams(request, "noresults");
         assertEquals(0.7, request.getTemperature());
@@ -1620,6 +1624,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_applyDefaultParams_docnotfound() {
+        client.setTestModel("gpt-4o");
         final LlmChatRequest request = new LlmChatRequest();
         client.applyDefaultParams(request, "docnotfound");
         assertEquals(0.7, request.getTemperature());
@@ -1628,6 +1633,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_applyDefaultParams_direct() {
+        client.setTestModel("gpt-4o");
         final LlmChatRequest request = new LlmChatRequest();
         client.applyDefaultParams(request, "direct");
         assertEquals(0.7, request.getTemperature());
@@ -1636,6 +1642,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_applyDefaultParams_faq() {
+        client.setTestModel("gpt-4o");
         final LlmChatRequest request = new LlmChatRequest();
         client.applyDefaultParams(request, "faq");
         assertEquals(0.7, request.getTemperature());
@@ -1644,6 +1651,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_applyDefaultParams_answer() {
+        client.setTestModel("gpt-4o");
         final LlmChatRequest request = new LlmChatRequest();
         client.applyDefaultParams(request, "answer");
         assertEquals(0.5, request.getTemperature());
@@ -1652,6 +1660,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_applyDefaultParams_summary() {
+        client.setTestModel("gpt-4o");
         final LlmChatRequest request = new LlmChatRequest();
         client.applyDefaultParams(request, "summary");
         assertEquals(0.3, request.getTemperature());
@@ -1674,6 +1683,133 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         client.applyDefaultParams(request, "intent");
         assertEquals(0.9, request.getTemperature());
         assertEquals(Integer.valueOf(100), request.getMaxTokens());
+    }
+
+    // ========== applyDefaultParams: reasoning model tests ==========
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_multipliesTokens_intent() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "intent");
+        // Default 256 * 4 = 1024
+        assertEquals(Integer.valueOf(1024), request.getMaxTokens());
+        assertEquals("low", request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_multipliesTokens_evaluation() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "evaluation");
+        assertEquals(Integer.valueOf(1024), request.getMaxTokens());
+        assertEquals("low", request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_multipliesTokens_unclear() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "unclear");
+        // Default 512 * 4 = 2048
+        assertEquals(Integer.valueOf(2048), request.getMaxTokens());
+        assertEquals("low", request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_multipliesTokens_answer() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "answer");
+        // Default 2048 * 4 = 8192
+        assertEquals(Integer.valueOf(8192), request.getMaxTokens());
+        // answer should NOT set reasoning_effort
+        assertNull(request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_multipliesTokens_direct() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "direct");
+        // Default 1024 * 4 = 4096
+        assertEquals(Integer.valueOf(4096), request.getMaxTokens());
+        assertNull(request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_doesNotOverrideUserMaxTokens() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        request.setMaxTokens(500);
+        client.applyDefaultParams(request, "intent");
+        // User set 500, should NOT be multiplied
+        assertEquals(Integer.valueOf(500), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_doesNotOverrideUserReasoningEffort() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        request.putExtraParam("reasoning_effort", "high");
+        client.applyDefaultParams(request, "intent");
+        // User set "high", should NOT be overridden
+        assertEquals("high", request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_nonReasoningModel_noMultiplier() {
+        client.setTestModel("gpt-4o");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "intent");
+        // Non-reasoning model: default 256, no multiplier
+        assertEquals(Integer.valueOf(256), request.getMaxTokens());
+        assertNull(request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_o1Model_multipliesTokens() {
+        client.setTestModel("o1");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "intent");
+        assertEquals(Integer.valueOf(1024), request.getMaxTokens());
+        assertEquals("low", request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_docnotfound() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "docnotfound");
+        assertEquals(Integer.valueOf(1024), request.getMaxTokens());
+        assertEquals("low", request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_noresults() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "noresults");
+        assertEquals(Integer.valueOf(2048), request.getMaxTokens());
+        assertEquals("low", request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_summary() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "summary");
+        assertEquals(Integer.valueOf(8192), request.getMaxTokens());
+        assertNull(request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_reasoningModel_faq() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest();
+        client.applyDefaultParams(request, "faq");
+        assertEquals(Integer.valueOf(4096), request.getMaxTokens());
+        assertNull(request.getExtraParam("reasoning_effort"));
     }
 
     // ========== buildRequestBody: top_p, frequency_penalty, presence_penalty tests ==========
@@ -1829,6 +1965,11 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
         protected int getMaxTokens() {
             return testMaxTokens;
+        }
+
+        @Override
+        protected int getReasoningTokenMultiplier() {
+            return 4;
         }
 
         @Override
