@@ -199,20 +199,18 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                     }
                 }
 
-                if (logger.isDebugEnabled()) {
-                    logger.debug(
-                            "Received chat response from OpenAI. model={}, promptTokens={}, completionTokens={}, totalTokens={}, contentLength={}, elapsedTime={}ms",
-                            chatResponse.getModel(), chatResponse.getPromptTokens(), chatResponse.getCompletionTokens(),
-                            chatResponse.getTotalTokens(), chatResponse.getContent() != null ? chatResponse.getContent().length() : 0,
-                            System.currentTimeMillis() - startTime);
-                }
+                logger.info(
+                        "[LLM:OPENAI] Chat response received. model={}, promptTokens={}, completionTokens={}, totalTokens={}, contentLength={}, elapsedTime={}ms",
+                        chatResponse.getModel(), chatResponse.getPromptTokens(), chatResponse.getCompletionTokens(),
+                        chatResponse.getTotalTokens(), chatResponse.getContent() != null ? chatResponse.getContent().length() : 0,
+                        System.currentTimeMillis() - startTime);
 
                 return chatResponse;
             }
         } catch (final LlmException e) {
             throw e;
         } catch (final Exception e) {
-            logger.warn("Failed to call OpenAI API. url={}, error={}", url, e.getMessage(), e);
+            logger.warn("[LLM:OPENAI] Failed to call OpenAI API. url={}, error={}", url, e.getMessage(), e);
             throw new LlmException("Failed to call OpenAI API", LlmException.ERROR_CONNECTION, e);
         }
     }
@@ -255,7 +253,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                 }
 
                 if (response.getEntity() == null) {
-                    logger.warn("Empty response from OpenAI streaming API. url={}", url);
+                    logger.warn("[LLM:OPENAI] Empty response from OpenAI streaming API. url={}", url);
                     throw new LlmException("Empty response from OpenAI");
                 }
 
@@ -302,16 +300,14 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                     }
                 }
 
-                if (logger.isDebugEnabled()) {
-                    logger.debug("[LLM:OPENAI] Completed streaming chat from OpenAI. url={}, chunkCount={}, elapsedTime={}ms", url,
-                            chunkCount, System.currentTimeMillis() - startTime);
-                }
+                logger.info("[LLM:OPENAI] Stream completed. chunkCount={}, elapsedTime={}ms", chunkCount,
+                        System.currentTimeMillis() - startTime);
             }
         } catch (final LlmException e) {
             callback.onError(e);
             throw e;
         } catch (final IOException e) {
-            logger.warn("Failed to stream from OpenAI API. url={}, error={}", url, e.getMessage(), e);
+            logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", url, e.getMessage(), e);
             final LlmException llmException = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
             callback.onError(llmException);
             throw llmException;
