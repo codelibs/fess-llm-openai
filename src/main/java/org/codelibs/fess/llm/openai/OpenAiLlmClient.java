@@ -161,8 +161,8 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                             // ignore
                         }
                     }
-                    logger.warn("OpenAI API error. url={}, statusCode={}, message={}, body={}", url, statusCode, response.getReasonPhrase(),
-                            errorBody);
+                    logger.warn("[LLM:OPENAI] API error. url={}, statusCode={}, message={}, body={}", url, statusCode,
+                            response.getReasonPhrase(), errorBody);
                     throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
                             resolveErrorCode(statusCode));
                 }
@@ -246,7 +246,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                             // ignore
                         }
                     }
-                    logger.warn("OpenAI streaming API error. url={}, statusCode={}, message={}, body={}", url, statusCode,
+                    logger.warn("[LLM:OPENAI] Streaming API error. url={}, statusCode={}, message={}, body={}", url, statusCode,
                             response.getReasonPhrase(), errorBody);
                     throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
                             resolveErrorCode(statusCode));
@@ -258,6 +258,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                 }
 
                 int chunkCount = 0;
+                long firstChunkTime = 0;
                 try (BufferedReader reader =
                         new BufferedReader(new InputStreamReader(response.getEntity().getContent(), StandardCharsets.UTF_8))) {
                     String line;
@@ -285,6 +286,9 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                                 if (firstChoice.has("delta") && firstChoice.get("delta").has("content")) {
                                     final String content = firstChoice.get("delta").get("content").asText();
                                     callback.onChunk(content, done);
+                                    if (chunkCount == 0) {
+                                        firstChunkTime = System.currentTimeMillis() - startTime;
+                                    }
                                     chunkCount++;
                                 } else if (done) {
                                     callback.onChunk("", true);
@@ -295,12 +299,12 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                                 }
                             }
                         } catch (final JsonProcessingException e) {
-                            logger.warn("Failed to parse OpenAI streaming response. line={}", line, e);
+                            logger.warn("[LLM:OPENAI] Failed to parse streaming response. line={}", line, e);
                         }
                     }
                 }
 
-                logger.info("[LLM:OPENAI] Stream completed. chunkCount={}, elapsedTime={}ms", chunkCount,
+                logger.info("[LLM:OPENAI] Stream completed. chunkCount={}, firstChunkMs={}, elapsedTime={}ms", chunkCount, firstChunkTime,
                         System.currentTimeMillis() - startTime);
             }
         } catch (final LlmException e) {
