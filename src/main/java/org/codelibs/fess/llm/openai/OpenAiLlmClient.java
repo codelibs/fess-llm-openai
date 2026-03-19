@@ -768,6 +768,71 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     }
 
     @Override
+    protected int getHistoryMaxChars() {
+        final String key = "rag.llm.openai.history.max.chars";
+        final String configValue = ComponentUtil.getFessConfig().getOrDefault(key, null);
+        if (configValue != null) {
+            final int value = Integer.parseInt(configValue);
+            if (value > 0) {
+                return value;
+            }
+        }
+        return 8000;
+    }
+
+    @Override
+    protected int getIntentHistoryMaxMessages() {
+        final String key = "rag.llm.openai.intent.history.max.messages";
+        final String configValue = ComponentUtil.getFessConfig().getOrDefault(key, null);
+        if (configValue != null) {
+            final int value = Integer.parseInt(configValue);
+            if (value > 0) {
+                return value;
+            }
+        }
+        return 8;
+    }
+
+    @Override
+    protected int getIntentHistoryMaxChars() {
+        final String key = "rag.llm.openai.intent.history.max.chars";
+        final String configValue = ComponentUtil.getFessConfig().getOrDefault(key, null);
+        if (configValue != null) {
+            final int value = Integer.parseInt(configValue);
+            if (value > 0) {
+                return value;
+            }
+        }
+        return 4000;
+    }
+
+    @Override
+    public int getHistoryAssistantMaxChars() {
+        final String key = "rag.llm.openai.history.assistant.max.chars";
+        final String configValue = ComponentUtil.getFessConfig().getOrDefault(key, null);
+        if (configValue != null) {
+            final int value = Integer.parseInt(configValue);
+            if (value > 0) {
+                return value;
+            }
+        }
+        return 800;
+    }
+
+    @Override
+    public int getHistoryAssistantSummaryMaxChars() {
+        final String key = "rag.llm.openai.history.assistant.summary.max.chars";
+        final String configValue = ComponentUtil.getFessConfig().getOrDefault(key, null);
+        if (configValue != null) {
+            final int value = Integer.parseInt(configValue);
+            if (value > 0) {
+                return value;
+            }
+        }
+        return 800;
+    }
+
+    @Override
     protected String getSystemPrompt() {
         if (systemPrompt == null) {
             throw new LlmException("systemPrompt is not configured for " + getName());

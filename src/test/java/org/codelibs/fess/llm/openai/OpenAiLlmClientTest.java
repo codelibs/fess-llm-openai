@@ -1888,6 +1888,23 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertNull(body.get("presence_penalty"));
     }
 
+    // ========== Budget method tests ==========
+
+    @Test
+    public void test_getHistoryMaxChars_default() {
+        assertEquals(8000, client.testGetHistoryMaxChars());
+    }
+
+    @Test
+    public void test_getIntentHistoryMaxMessages_default() {
+        assertEquals(8, client.testGetIntentHistoryMaxMessages());
+    }
+
+    @Test
+    public void test_getHistoryAssistantMaxChars_default() {
+        assertEquals(800, client.testGetHistoryAssistantMaxChars());
+    }
+
     // ========== Helper methods ==========
 
     private void setupClientForMockServer() {
@@ -1985,6 +2002,43 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         @Override
         protected int getAvailabilityCheckInterval() {
             return 0;
+        }
+
+        @Override
+        protected int getHistoryMaxChars() {
+            return 8000;
+        }
+
+        @Override
+        protected int getIntentHistoryMaxMessages() {
+            return 8;
+        }
+
+        @Override
+        protected int getIntentHistoryMaxChars() {
+            return 4000;
+        }
+
+        @Override
+        public int getHistoryAssistantMaxChars() {
+            return 800;
+        }
+
+        @Override
+        public int getHistoryAssistantSummaryMaxChars() {
+            return 800;
+        }
+
+        int testGetHistoryMaxChars() {
+            return getHistoryMaxChars();
+        }
+
+        int testGetIntentHistoryMaxMessages() {
+            return getIntentHistoryMaxMessages();
+        }
+
+        int testGetHistoryAssistantMaxChars() {
+            return getHistoryAssistantMaxChars();
         }
     }
 }
