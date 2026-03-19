@@ -81,6 +81,8 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     protected String faqAnswerSystemPrompt;
     /** The system prompt for direct answer generation. */
     protected String directAnswerSystemPrompt;
+    /** The prompt for query regeneration. */
+    protected String queryRegenerationPrompt;
 
     /**
      * Default constructor.
@@ -519,6 +521,12 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         this.directAnswerSystemPrompt = directAnswerSystemPrompt;
     }
 
+    /** Sets the prompt for query regeneration.
+     * @param queryRegenerationPrompt the query regeneration prompt */
+    public void setQueryRegenerationPrompt(final String queryRegenerationPrompt) {
+        this.queryRegenerationPrompt = queryRegenerationPrompt;
+    }
+
     /**
      * Gets the OpenAI API key.
      *
@@ -642,6 +650,14 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                 request.setMaxTokens(2048);
             }
             break;
+        case "queryregeneration":
+            if (request.getTemperature() == null) {
+                request.setTemperature(0.3);
+            }
+            if (request.getMaxTokens() == null) {
+                request.setMaxTokens(256);
+            }
+            break;
         default:
             break;
         }
@@ -667,6 +683,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                 case "docnotfound":
                 case "unclear":
                 case "noresults":
+                case "queryregeneration":
                     request.putExtraParam("reasoning_effort", "low");
                     if (logger.isDebugEnabled()) {
                         logger.debug("[LLM:OPENAI] Applied default reasoning_effort=low. promptType={}", promptType);
@@ -828,5 +845,13 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             throw new LlmException("directAnswerSystemPrompt is not configured for " + getName());
         }
         return directAnswerSystemPrompt;
+    }
+
+    @Override
+    protected String getQueryRegenerationPrompt() {
+        if (queryRegenerationPrompt == null) {
+            throw new LlmException("queryRegenerationPrompt is not configured for " + getName());
+        }
+        return queryRegenerationPrompt;
     }
 }
