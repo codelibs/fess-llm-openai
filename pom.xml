@@ -4,12 +4,12 @@
 	<artifactId>fess-llm-openai</artifactId>
 	<packaging>jar</packaging>
 	<name>OpenAI LLM Plugin</name>
-	<version>15.6.0</version>
+	<version>15.6.1-SNAPSHOT</version>
 	<scm>
 		<connection>scm:git:git@github.com:codelibs/fess-llm-openai.git</connection>
 		<developerConnection>scm:git:git@github.com:codelibs/fess-llm-openai.git</developerConnection>
 		<url>https://github.com/codelibs/fess-llm-openai</url>
-	  <tag>fess-llm-openai-15.6.0</tag>
+	  <tag>HEAD</tag>
   </scm>
 	<parent>
 		<groupId>org.codelibs.fess</groupId>
