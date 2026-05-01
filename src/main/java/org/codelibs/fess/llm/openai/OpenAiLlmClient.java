@@ -103,6 +103,34 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         return statusCode == 429 || statusCode == 500 || statusCode == 502 || statusCode == 503 || statusCode == 504;
     }
 
+    /** Maximum seconds we'll honor from a server-provided {@code Retry-After}. */
+    static final long RETRY_AFTER_CAP_SECONDS = 600L;
+
+    /**
+     * Parses an HTTP {@code Retry-After} header value as integer seconds. HTTP-date format
+     * is intentionally unsupported (returns {@code -1}) so the caller falls back to
+     * exponential backoff. Negative or non-numeric values also return {@code -1}.
+     * Values exceeding {@link #RETRY_AFTER_CAP_SECONDS} are clamped.
+     */
+    static long parseRetryAfterSeconds(final String value) {
+        if (value == null) {
+            return -1L;
+        }
+        final String trimmed = value.trim();
+        if (trimmed.isEmpty()) {
+            return -1L;
+        }
+        try {
+            final long seconds = Long.parseLong(trimmed);
+            if (seconds < 0) {
+                return -1L;
+            }
+            return Math.min(seconds, RETRY_AFTER_CAP_SECONDS);
+        } catch (final NumberFormatException e) {
+            return -1L;
+        }
+    }
+
     @Override
     public String getName() {
         return NAME;

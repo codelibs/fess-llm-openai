@@ -2008,6 +2008,55 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertFalse(OpenAiLlmClient.isRetryableStatus(200));
     }
 
+    // ========== parseRetryAfterSeconds tests ==========
+
+    @Test
+    public void test_parseRetryAfterSeconds_integer() {
+        assertEquals(5L, OpenAiLlmClient.parseRetryAfterSeconds("5"));
+    }
+
+    @Test
+    public void test_parseRetryAfterSeconds_zero() {
+        assertEquals(0L, OpenAiLlmClient.parseRetryAfterSeconds("0"));
+    }
+
+    @Test
+    public void test_parseRetryAfterSeconds_largeClamped() {
+        assertEquals(600L, OpenAiLlmClient.parseRetryAfterSeconds("3600"));
+    }
+
+    @Test
+    public void test_parseRetryAfterSeconds_negative() {
+        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds("-1"));
+    }
+
+    @Test
+    public void test_parseRetryAfterSeconds_null() {
+        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds(null));
+    }
+
+    @Test
+    public void test_parseRetryAfterSeconds_blank() {
+        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds(""));
+        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds("  "));
+    }
+
+    @Test
+    public void test_parseRetryAfterSeconds_httpDate() {
+        // HTTP-date format intentionally unsupported; caller falls back to backoff.
+        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds("Wed, 21 Oct 2026 07:28:00 GMT"));
+    }
+
+    @Test
+    public void test_parseRetryAfterSeconds_decimal() {
+        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds("1.5"));
+    }
+
+    @Test
+    public void test_parseRetryAfterSeconds_whitespacePadded() {
+        assertEquals(7L, OpenAiLlmClient.parseRetryAfterSeconds("  7  "));
+    }
+
     // ========== Helper methods ==========
 
     private LlmChatRequest buildSimpleRequest() {
