@@ -2057,6 +2057,41 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertEquals(7L, OpenAiLlmClient.parseRetryAfterSeconds("  7  "));
     }
 
+    // ========== maskCredentialInUrl tests ==========
+
+    @Test
+    public void test_maskCredentialInUrl_apiKey() {
+        assertEquals("https://proxy/v1/chat?api_key=***", OpenAiLlmClient.maskCredentialInUrl("https://proxy/v1/chat?api_key=sk-secret"));
+    }
+
+    @Test
+    public void test_maskCredentialInUrl_key() {
+        assertEquals("https://proxy/v1/chat?key=***&model=x",
+                OpenAiLlmClient.maskCredentialInUrl("https://proxy/v1/chat?key=secret&model=x"));
+    }
+
+    @Test
+    public void test_maskCredentialInUrl_token() {
+        assertEquals("https://proxy/v1/chat?model=x&token=***",
+                OpenAiLlmClient.maskCredentialInUrl("https://proxy/v1/chat?model=x&token=abc"));
+    }
+
+    @Test
+    public void test_maskCredentialInUrl_apiKeyMixedCase() {
+        assertEquals("https://proxy/v1/chat?Api-Key=***", OpenAiLlmClient.maskCredentialInUrl("https://proxy/v1/chat?Api-Key=secret"));
+    }
+
+    @Test
+    public void test_maskCredentialInUrl_noCredential() {
+        assertEquals("https://api.openai.com/v1/chat/completions",
+                OpenAiLlmClient.maskCredentialInUrl("https://api.openai.com/v1/chat/completions"));
+    }
+
+    @Test
+    public void test_maskCredentialInUrl_null() {
+        assertNull(OpenAiLlmClient.maskCredentialInUrl(null));
+    }
+
     // ========== Helper methods ==========
 
     private LlmChatRequest buildSimpleRequest() {

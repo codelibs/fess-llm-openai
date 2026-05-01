@@ -131,6 +131,26 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         }
     }
 
+    /**
+     * Masks credential-bearing query parameters in a URL. Strips values for keys
+     * {@code api_key}, {@code apikey}, {@code api-key}, {@code key}, {@code token},
+     * {@code access_token} (case-insensitive), replacing each value with {@code ***}.
+     *
+     * <p>OpenAI uses header authentication - the canonical {@code https://api.openai.com}
+     * URL does not contain credentials - but {@code rag.llm.openai.api.url} may point at
+     * proxies (Azure, vLLM, custom gateways) that do, so all log lines that include a URL
+     * route through this helper.
+     *
+     * @param url the URL to mask (may be {@code null}).
+     * @return the URL with credential values replaced by {@code ***}, or {@code null} when input is null.
+     */
+    static String maskCredentialInUrl(final String url) {
+        if (url == null) {
+            return null;
+        }
+        return url.replaceAll("(?i)([?&](?:api[-_]?key|key|token|access[-_]?token)=)[^&]*", "$1***");
+    }
+
     @Override
     public String getName() {
         return NAME;
