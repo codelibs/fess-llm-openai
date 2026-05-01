@@ -256,6 +256,31 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         throw lastParse;
     }
 
+    /**
+     * Renders an OpenAI error response body as a single-line diagnostic. Returns
+     * {@code "type=...,code=...,param=...,message=..."} when the body parses as the
+     * documented {@code {"error":{...}}} envelope; otherwise returns the body trimmed
+     * (clipped at 1024 chars + {@code "...(truncated)"} suffix) so non-JSON gateway
+     * pages remain readable in logs.
+     */
+    protected String extractErrorDetails(final String errorBody) {
+        if (errorBody == null || errorBody.isEmpty()) {
+            return "";
+        }
+        try {
+            final JsonNode root = objectMapper.readTree(errorBody);
+            if (root.isObject() && root.has("error") && root.get("error").isObject()) {
+                final JsonNode err = root.get("error");
+                return String.format("type=%s,code=%s,param=%s,message=%s", err.path("type").asText("null"),
+                        err.path("code").asText("null"), err.path("param").asText("null"), err.path("message").asText("null"));
+            }
+        } catch (final JsonProcessingException e) {
+            // fall through to raw clip
+        }
+        final String trimmed = errorBody.trim();
+        return trimmed.length() > 1024 ? trimmed.substring(0, 1024) + "...(truncated)" : trimmed;
+    }
+
     @Override
     public String getName() {
         return NAME;

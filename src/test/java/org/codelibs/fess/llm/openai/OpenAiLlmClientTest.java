@@ -2118,6 +2118,55 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertEquals(500L, client.getRetryBaseDelayMs());
     }
 
+    // ========== extractErrorDetails tests ==========
+
+    @Test
+    public void test_extractErrorDetails_full() {
+        final String body = "{\"error\":{\"message\":\"Invalid API key\",\"type\":\"invalid_request_error\","
+                + "\"code\":\"invalid_api_key\",\"param\":null}}";
+        final String result = client.extractErrorDetails(body);
+        assertTrue(result.contains("type=invalid_request_error"));
+        assertTrue(result.contains("code=invalid_api_key"));
+        assertTrue(result.contains("message=Invalid API key"));
+    }
+
+    @Test
+    public void test_extractErrorDetails_partial() {
+        final String body = "{\"error\":{\"message\":\"oops\"}}";
+        final String result = client.extractErrorDetails(body);
+        assertTrue(result.contains("message=oops"));
+        assertTrue(result.contains("type=null"));
+    }
+
+    @Test
+    public void test_extractErrorDetails_nonJson_html() {
+        final String body = "<html>502 Bad Gateway</html>";
+        final String result = client.extractErrorDetails(body);
+        // Either the parser throws (we clip and return verbatim) or treats it as a single
+        // string token; either way the body content must remain readable in logs.
+        assertTrue(result.contains("502 Bad Gateway"));
+    }
+
+    @Test
+    public void test_extractErrorDetails_emptyJsonObject() {
+        // {} parses, but has no "error" key - fall through to clip path.
+        assertEquals("{}", client.extractErrorDetails("{}"));
+    }
+
+    @Test
+    public void test_extractErrorDetails_long_truncated() {
+        final String body = "x".repeat(2000);
+        final String result = client.extractErrorDetails(body);
+        assertTrue(result.endsWith("...(truncated)"));
+        assertEquals(1024 + "...(truncated)".length(), result.length());
+    }
+
+    @Test
+    public void test_extractErrorDetails_null_blank() {
+        assertEquals("", client.extractErrorDetails(null));
+        assertEquals("", client.extractErrorDetails(""));
+    }
+
     // ========== Helper methods ==========
 
     private LlmChatRequest buildSimpleRequest() {
