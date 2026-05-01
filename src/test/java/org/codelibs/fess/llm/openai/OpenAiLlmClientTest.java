@@ -1911,6 +1911,50 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertEquals(800, client.testGetHistoryAssistantMaxChars());
     }
 
+    // ========== isAbnormalFinishReason tests ==========
+
+    @Test
+    public void test_isAbnormalFinishReason_null() {
+        assertFalse(OpenAiLlmClient.isAbnormalFinishReason(null));
+    }
+
+    @Test
+    public void test_isAbnormalFinishReason_stop() {
+        assertFalse(OpenAiLlmClient.isAbnormalFinishReason("stop"));
+    }
+
+    @Test
+    public void test_isAbnormalFinishReason_length() {
+        assertTrue(OpenAiLlmClient.isAbnormalFinishReason("length"));
+    }
+
+    @Test
+    public void test_isAbnormalFinishReason_contentFilter() {
+        assertTrue(OpenAiLlmClient.isAbnormalFinishReason("content_filter"));
+    }
+
+    @Test
+    public void test_isAbnormalFinishReason_toolCalls() {
+        assertTrue(OpenAiLlmClient.isAbnormalFinishReason("tool_calls"));
+    }
+
+    @Test
+    public void test_isAbnormalFinishReason_functionCall() {
+        assertTrue(OpenAiLlmClient.isAbnormalFinishReason("function_call"));
+    }
+
+    @Test
+    public void test_isAbnormalFinishReason_unknown() {
+        assertTrue(OpenAiLlmClient.isAbnormalFinishReason("error"));
+        assertTrue(OpenAiLlmClient.isAbnormalFinishReason("future_reason"));
+    }
+
+    @Test
+    public void test_isAbnormalFinishReason_blank() {
+        assertFalse(OpenAiLlmClient.isAbnormalFinishReason(""));
+        assertFalse(OpenAiLlmClient.isAbnormalFinishReason("  "));
+    }
+
     // ========== Helper methods ==========
 
     private LlmChatRequest buildSimpleRequest() {

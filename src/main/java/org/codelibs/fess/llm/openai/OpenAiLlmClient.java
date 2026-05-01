@@ -68,6 +68,31 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         // Default constructor
     }
 
+    /**
+     * Returns whether the given {@code finish_reason} indicates an abnormal completion.
+     *
+     * <p>For OpenAI, only {@code "stop"} (and absent / blank values) is nominal. All other
+     * values WARN, including:
+     * <ul>
+     *   <li>{@code "length"} - output was truncated by {@code max_tokens}.</li>
+     *   <li>{@code "content_filter"} - moderation removed content; raise to operators.</li>
+     *   <li>{@code "tool_calls"} / {@code "function_call"} - Fess RAG never enables tool /
+     *       function calling, so seeing these means a misconfiguration in
+     *       {@code extra_params}; surfacing them lets operators correct it.</li>
+     *   <li>Any future unknown value - surface so operators can update this client.</li>
+     * </ul>
+     */
+    static boolean isAbnormalFinishReason(final String reason) {
+        if (reason == null) {
+            return false;
+        }
+        final String trimmed = reason.trim();
+        if (trimmed.isEmpty() || "stop".equals(trimmed)) {
+            return false;
+        }
+        return true;
+    }
+
     @Override
     public String getName() {
         return NAME;
