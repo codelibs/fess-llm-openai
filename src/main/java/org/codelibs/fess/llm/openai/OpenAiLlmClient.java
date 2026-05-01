@@ -176,6 +176,16 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     }
 
     /**
+     * Whether to opt in to {@code stream_options.include_usage=true} on streaming requests so
+     * the final SSE chunk carries token usage. Default {@code true}; set to {@code false} for
+     * OpenAI-compatible backends that reject the field. Configured via
+     * {@code rag.llm.openai.stream.include.usage}.
+     */
+    protected boolean isStreamUsageEnabled() {
+        return Boolean.parseBoolean(ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + ".stream.include.usage", "true"));
+    }
+
+    /**
      * Internal signal thrown by the HTTP call body to indicate the received status code is
      * retryable per {@link #isRetryableStatus(int)}. Caught by {@link #executeWithRetry};
      * never escapes the client.
@@ -559,6 +569,12 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         body.put("messages", messages);
 
         body.put("stream", stream);
+
+        if (stream && isStreamUsageEnabled()) {
+            final Map<String, Object> streamOptions = new HashMap<>();
+            streamOptions.put("include_usage", Boolean.TRUE);
+            body.put("stream_options", streamOptions);
+        }
 
         if (supportsTemperature(model) && request.getTemperature() != null) {
             body.put("temperature", request.getTemperature());

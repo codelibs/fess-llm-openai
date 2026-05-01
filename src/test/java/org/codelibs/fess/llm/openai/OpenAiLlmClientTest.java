@@ -208,6 +208,28 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     }
 
     @Test
+    public void test_buildRequestBody_streamingIncludesUsageByDefault() {
+        final Map<String, Object> body = client.buildRequestBody(buildSimpleRequest(), true);
+        @SuppressWarnings("unchecked")
+        final Map<String, Object> opts = (Map<String, Object>) body.get("stream_options");
+        assertNotNull(opts, "stream_options should be present for streaming requests");
+        assertEquals(Boolean.TRUE, opts.get("include_usage"));
+    }
+
+    @Test
+    public void test_buildRequestBody_nonStreamingExcludesStreamOptions() {
+        final Map<String, Object> body = client.buildRequestBody(buildSimpleRequest(), false);
+        assertNull(body.get("stream_options"), "stream_options must not appear on non-streaming requests");
+    }
+
+    @Test
+    public void test_buildRequestBody_streamingOmitsUsageWhenDisabled() {
+        client.setTestConfig("stream.include.usage", "false");
+        final Map<String, Object> body = client.buildRequestBody(buildSimpleRequest(), true);
+        assertNull(body.get("stream_options"), "opt-out via config");
+    }
+
+    @Test
     public void test_buildRequestBody_multipleMessages() {
         client.setTestModel("gpt-5-mini");
         client.setTestTemperature(0.7);
@@ -2622,6 +2644,12 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         protected long getRetryBaseDelayMs() {
             final String v = testConfigOverrides.get("retry.base.delay.ms");
             return v != null ? Long.parseLong(v) : super.getRetryBaseDelayMs();
+        }
+
+        @Override
+        protected boolean isStreamUsageEnabled() {
+            final String v = testConfigOverrides.get("stream.include.usage");
+            return v != null ? Boolean.parseBoolean(v) : super.isStreamUsageEnabled();
         }
 
         void setTestApiKey(final String apiKey) {
