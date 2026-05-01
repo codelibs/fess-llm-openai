@@ -93,6 +93,16 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         return true;
     }
 
+    /**
+     * Returns whether the given HTTP status code should be retried. Retryable: {@code 429}
+     * (rate limit), {@code 500} (server error), {@code 502} (bad gateway - OpenAI returns
+     * this under upstream overload), {@code 503} (service unavailable), {@code 504}
+     * (gateway timeout). All other statuses propagate immediately.
+     */
+    static boolean isRetryableStatus(final int statusCode) {
+        return statusCode == 429 || statusCode == 500 || statusCode == 502 || statusCode == 503 || statusCode == 504;
+    }
+
     @Override
     public String getName() {
         return NAME;

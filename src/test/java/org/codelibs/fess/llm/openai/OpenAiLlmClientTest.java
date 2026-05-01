@@ -1955,6 +1955,59 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertFalse(OpenAiLlmClient.isAbnormalFinishReason("  "));
     }
 
+    // ========== isRetryableStatus tests ==========
+
+    @Test
+    public void test_isRetryableStatus_429() {
+        assertTrue(OpenAiLlmClient.isRetryableStatus(429));
+    }
+
+    @Test
+    public void test_isRetryableStatus_500() {
+        assertTrue(OpenAiLlmClient.isRetryableStatus(500));
+    }
+
+    @Test
+    public void test_isRetryableStatus_502() {
+        assertTrue(OpenAiLlmClient.isRetryableStatus(502));
+    }
+
+    @Test
+    public void test_isRetryableStatus_503() {
+        assertTrue(OpenAiLlmClient.isRetryableStatus(503));
+    }
+
+    @Test
+    public void test_isRetryableStatus_504() {
+        assertTrue(OpenAiLlmClient.isRetryableStatus(504));
+    }
+
+    @Test
+    public void test_isRetryableStatus_400() {
+        assertFalse(OpenAiLlmClient.isRetryableStatus(400));
+    }
+
+    @Test
+    public void test_isRetryableStatus_401() {
+        assertFalse(OpenAiLlmClient.isRetryableStatus(401));
+    }
+
+    @Test
+    public void test_isRetryableStatus_404() {
+        assertFalse(OpenAiLlmClient.isRetryableStatus(404));
+    }
+
+    @Test
+    public void test_isRetryableStatus_408_notRetried() {
+        // OpenAI rarely returns 408; if it ever appears in production logs we'll add it.
+        assertFalse(OpenAiLlmClient.isRetryableStatus(408));
+    }
+
+    @Test
+    public void test_isRetryableStatus_200() {
+        assertFalse(OpenAiLlmClient.isRetryableStatus(200));
+    }
+
     // ========== Helper methods ==========
 
     private LlmChatRequest buildSimpleRequest() {
