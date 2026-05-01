@@ -591,7 +591,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         mockServer.enqueue(new MockResponse().setResponseCode(200).setBody(simpleSuccessBody()));
         final long start = System.currentTimeMillis();
         client.chat(buildSimpleRequest());
-        assertTrue("Retry-After=0 must override large backoff", System.currentTimeMillis() - start < 5000);
+        // Threshold loose enough to absorb CI noise; the configured backoff is 100s, so any sub-30s
+        // run proves Retry-After=0 took precedence.
+        assertTrue("Retry-After=0 must override large backoff", System.currentTimeMillis() - start < 30000);
     }
 
     @Test
@@ -603,7 +605,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         mockServer.enqueue(new MockResponse().setResponseCode(200).setBody(simpleSuccessBody()));
         final long start = System.currentTimeMillis();
         client.chat(buildSimpleRequest());
-        assertTrue(System.currentTimeMillis() - start < 5000);
+        assertTrue(System.currentTimeMillis() - start < 30000);
     }
 
     @Test

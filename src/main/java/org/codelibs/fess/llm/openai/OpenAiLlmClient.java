@@ -145,11 +145,14 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * @param url the URL to mask (may be {@code null}).
      * @return the URL with credential values replaced by {@code ***}, or {@code null} when input is null.
      */
+    private static final java.util.regex.Pattern CREDENTIAL_QUERY_PARAM_PATTERN =
+            java.util.regex.Pattern.compile("(?i)([?&](?:api[-_]?key|key|token|access[-_]?token)=)[^&]*");
+
     static String maskCredentialInUrl(final String url) {
         if (url == null) {
             return null;
         }
-        return url.replaceAll("(?i)([?&](?:api[-_]?key|key|token|access[-_]?token)=)[^&]*", "$1***");
+        return CREDENTIAL_QUERY_PARAM_PATTERN.matcher(url).replaceAll("$1***");
     }
 
     /**
@@ -273,16 +276,23 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * (clipped at 1024 chars + {@code "...(truncated)"} suffix) so non-JSON gateway
      * pages remain readable in logs.
      */
+    private static final String ERROR_ENVELOPE_FIELD = "error";
+    private static final String ERROR_FIELD_TYPE = "type";
+    private static final String ERROR_FIELD_CODE = "code";
+    private static final String ERROR_FIELD_PARAM = "param";
+    private static final String ERROR_FIELD_MESSAGE = "message";
+
     protected String extractErrorDetails(final String errorBody) {
         if (errorBody == null || errorBody.isEmpty()) {
             return "";
         }
         try {
             final JsonNode root = objectMapper.readTree(errorBody);
-            if (root.isObject() && root.has("error") && root.get("error").isObject()) {
-                final JsonNode err = root.get("error");
-                return String.format("type=%s,code=%s,param=%s,message=%s", err.path("type").asText("null"),
-                        err.path("code").asText("null"), err.path("param").asText("null"), err.path("message").asText("null"));
+            if (root.isObject() && root.has(ERROR_ENVELOPE_FIELD) && root.get(ERROR_ENVELOPE_FIELD).isObject()) {
+                final JsonNode err = root.get(ERROR_ENVELOPE_FIELD);
+                return String.format("%s=%s,%s=%s,%s=%s,%s=%s", ERROR_FIELD_TYPE, err.path(ERROR_FIELD_TYPE).asText("null"),
+                        ERROR_FIELD_CODE, err.path(ERROR_FIELD_CODE).asText("null"), ERROR_FIELD_PARAM,
+                        err.path(ERROR_FIELD_PARAM).asText("null"), ERROR_FIELD_MESSAGE, err.path(ERROR_FIELD_MESSAGE).asText("null"));
             }
         } catch (final JsonProcessingException e) {
             // fall through to raw clip
@@ -678,19 +688,9 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             final LlmException llm = new LlmException("OpenAI API retryable exhausted", LlmException.ERROR_CONNECTION, e);
             callback.onError(llm);
             throw llm;
-        } catch (final IOException e) {
-            logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
-            final LlmException llm = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
-            callback.onError(llm);
-            throw llm;
-        } catch (final ParseException e) {
-            logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
-            final LlmException llm = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
-            callback.onError(llm);
-            throw llm;
-        } catch (final RuntimeException e) {
-            // Mirrors chat()'s catch-all so unexpected runtime failures still notify the
-            // callback before propagating, preserving onError symmetry consumers may rely on.
+        } catch (final IOException | ParseException | RuntimeException e) {
+            // RuntimeException covers consumer onChunk failures and unexpected JSON / runtime
+            // errors; the callback is always notified before propagating so onError stays symmetric with chat().
             logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
             final LlmException llm = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
             callback.onError(llm);
