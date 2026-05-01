@@ -325,12 +325,13 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     @Override
     public LlmChatResponse chat(final LlmChatRequest request) {
         final String url = getApiUrl() + "/chat/completions";
+        final String maskedUrl = maskCredentialInUrl(url);
         final Map<String, Object> requestBody = buildRequestBody(request, false);
         final long startTime = System.currentTimeMillis();
 
         if (logger.isDebugEnabled()) {
-            logger.debug("[LLM:OPENAI] Sending chat request to OpenAI. url={}, model={}, messageCount={}", url, requestBody.get("model"),
-                    request.getMessages().size());
+            logger.debug("[LLM:OPENAI] Sending chat request to OpenAI. url={}, model={}, messageCount={}", maskedUrl,
+                    requestBody.get("model"), request.getMessages().size());
         }
 
         try {
@@ -339,70 +340,98 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                 logger.debug("[LLM:OPENAI] requestBody={}", json);
             }
             final HttpPost httpRequest = new HttpPost(url);
-            httpRequest.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON));
+            httpRequest.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON)); // repeatable per HttpClient 5 contract
             httpRequest.addHeader("Authorization", "Bearer " + getApiKey());
 
-            try (var response = getHttpClient().execute(httpRequest)) {
-                final int statusCode = response.getCode();
-                if (statusCode < 200 || statusCode >= 300) {
-                    String errorBody = "";
-                    if (response.getEntity() != null) {
-                        try {
-                            errorBody = EntityUtils.toString(response.getEntity());
-                        } catch (final IOException e) {
-                            // ignore
+            return executeWithRetry("chat", () -> {
+                try (var response = getHttpClient().execute(httpRequest)) {
+                    final int statusCode = response.getCode();
+                    if (statusCode < 200 || statusCode >= 300) {
+                        String errorBody = "";
+                        if (response.getEntity() != null) {
+                            try {
+                                errorBody = EntityUtils.toString(response.getEntity());
+                            } catch (final IOException e) { /* ignore */ }
+                        }
+                        final String errorDetails = extractErrorDetails(errorBody);
+                        logger.warn("[LLM:OPENAI] API error. url={}, statusCode={}, message={}, error={}", maskedUrl, statusCode,
+                                response.getReasonPhrase(), errorDetails);
+                        if (isRetryableStatus(statusCode)) {
+                            final var ra = response.getFirstHeader("Retry-After");
+                            final long retryAfter = parseRetryAfterSeconds(ra != null ? ra.getValue() : null);
+                            throw new RetryableHttpException(statusCode, response.getReasonPhrase(), retryAfter);
+                        }
+                        throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
+                                resolveErrorCode(statusCode));
+                    }
+
+                    final String responseBody = response.getEntity() != null ? EntityUtils.toString(response.getEntity()) : "";
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("[LLM:OPENAI] responseBody={}", responseBody);
+                    }
+                    final JsonNode jsonNode = objectMapper.readTree(responseBody);
+
+                    final LlmChatResponse chatResponse = new LlmChatResponse();
+                    if (jsonNode.has("choices") && jsonNode.get("choices").isArray() && jsonNode.get("choices").size() > 0) {
+                        final JsonNode firstChoice = jsonNode.get("choices").get(0);
+                        if (firstChoice.has("message") && firstChoice.get("message").has("content")
+                                && !firstChoice.get("message").get("content").isNull()) {
+                            chatResponse.setContent(firstChoice.get("message").get("content").asText());
+                        }
+                        if (firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull()) {
+                            chatResponse.setFinishReason(firstChoice.get("finish_reason").asText());
                         }
                     }
-                    logger.warn("[LLM:OPENAI] API error. url={}, statusCode={}, message={}, body={}", url, statusCode,
-                            response.getReasonPhrase(), errorBody);
-                    throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
-                            resolveErrorCode(statusCode));
-                }
+                    if (jsonNode.has("model")) {
+                        chatResponse.setModel(jsonNode.get("model").asText());
+                    }
+                    final String responseId = jsonNode.has("id") && !jsonNode.get("id").isNull() ? jsonNode.get("id").asText() : null;
+                    final String systemFingerprint = jsonNode.has("system_fingerprint") && !jsonNode.get("system_fingerprint").isNull()
+                            ? jsonNode.get("system_fingerprint").asText()
+                            : null;
+                    Integer reasoningTokens = null;
+                    Integer cachedTokens = null;
+                    if (jsonNode.has("usage")) {
+                        final JsonNode usage = jsonNode.get("usage");
+                        if (usage.has("prompt_tokens"))
+                            chatResponse.setPromptTokens(usage.get("prompt_tokens").asInt());
+                        if (usage.has("completion_tokens"))
+                            chatResponse.setCompletionTokens(usage.get("completion_tokens").asInt());
+                        if (usage.has("total_tokens"))
+                            chatResponse.setTotalTokens(usage.get("total_tokens").asInt());
+                        if (usage.has("completion_tokens_details") && usage.get("completion_tokens_details").has("reasoning_tokens")) {
+                            reasoningTokens = usage.get("completion_tokens_details").get("reasoning_tokens").asInt();
+                        }
+                        if (usage.has("prompt_tokens_details") && usage.get("prompt_tokens_details").has("cached_tokens")) {
+                            cachedTokens = usage.get("prompt_tokens_details").get("cached_tokens").asInt();
+                        }
+                    }
 
-                final String responseBody = response.getEntity() != null ? EntityUtils.toString(response.getEntity()) : "";
-                if (logger.isDebugEnabled()) {
-                    logger.debug("[LLM:OPENAI] responseBody={}", responseBody);
+                    logger.info(
+                            "[LLM:OPENAI] Chat response received. model={}, id={}, systemFingerprint={}, "
+                                    + "promptTokens={}, cachedTokens={}, completionTokens={}, reasoningTokens={}, "
+                                    + "totalTokens={}, finishReason={}, contentLength={}, elapsedTime={}ms",
+                            chatResponse.getModel(), responseId, systemFingerprint, chatResponse.getPromptTokens(), cachedTokens,
+                            chatResponse.getCompletionTokens(), reasoningTokens, chatResponse.getTotalTokens(),
+                            chatResponse.getFinishReason(), chatResponse.getContent() != null ? chatResponse.getContent().length() : 0,
+                            System.currentTimeMillis() - startTime);
+                    if (isAbnormalFinishReason(chatResponse.getFinishReason())) {
+                        logger.warn(
+                                "[LLM:OPENAI] Chat finished abnormally. id={}, finishReason={}, "
+                                        + "completionTokens={}, reasoningTokens={}, contentLength={}, model={}",
+                                responseId, chatResponse.getFinishReason(), chatResponse.getCompletionTokens(), reasoningTokens,
+                                chatResponse.getContent() != null ? chatResponse.getContent().length() : 0, chatResponse.getModel());
+                    }
+                    return chatResponse;
                 }
-                final JsonNode jsonNode = objectMapper.readTree(responseBody);
-
-                final LlmChatResponse chatResponse = new LlmChatResponse();
-                if (jsonNode.has("choices") && jsonNode.get("choices").isArray() && jsonNode.get("choices").size() > 0) {
-                    final JsonNode firstChoice = jsonNode.get("choices").get(0);
-                    if (firstChoice.has("message") && firstChoice.get("message").has("content")) {
-                        chatResponse.setContent(firstChoice.get("message").get("content").asText());
-                    }
-                    if (firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull()) {
-                        chatResponse.setFinishReason(firstChoice.get("finish_reason").asText());
-                    }
-                }
-                if (jsonNode.has("model")) {
-                    chatResponse.setModel(jsonNode.get("model").asText());
-                }
-                if (jsonNode.has("usage")) {
-                    final JsonNode usage = jsonNode.get("usage");
-                    if (usage.has("prompt_tokens")) {
-                        chatResponse.setPromptTokens(usage.get("prompt_tokens").asInt());
-                    }
-                    if (usage.has("completion_tokens")) {
-                        chatResponse.setCompletionTokens(usage.get("completion_tokens").asInt());
-                    }
-                    if (usage.has("total_tokens")) {
-                        chatResponse.setTotalTokens(usage.get("total_tokens").asInt());
-                    }
-                }
-
-                logger.info(
-                        "[LLM:OPENAI] Chat response received. model={}, promptTokens={}, completionTokens={}, totalTokens={}, contentLength={}, elapsedTime={}ms",
-                        chatResponse.getModel(), chatResponse.getPromptTokens(), chatResponse.getCompletionTokens(),
-                        chatResponse.getTotalTokens(), chatResponse.getContent() != null ? chatResponse.getContent().length() : 0,
-                        System.currentTimeMillis() - startTime);
-
-                return chatResponse;
-            }
+            });
         } catch (final LlmException e) {
             throw e;
+        } catch (final RetryableHttpException e) {
+            // Defensive: executeWithRetry consumes RetryableHttpException; this should never fire.
+            throw new LlmException("OpenAI API retryable exhausted", LlmException.ERROR_CONNECTION, e);
         } catch (final Exception e) {
-            logger.warn("[LLM:OPENAI] Failed to call OpenAI API. url={}, error={}", url, e.getMessage(), e);
+            logger.warn("[LLM:OPENAI] Failed to call OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
             throw new LlmException("Failed to call OpenAI API", LlmException.ERROR_CONNECTION, e);
         }
     }

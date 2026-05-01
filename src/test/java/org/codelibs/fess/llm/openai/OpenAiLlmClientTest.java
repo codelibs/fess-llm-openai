@@ -383,6 +383,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         mockServer.enqueue(new MockResponse().setResponseCode(429).setBody(errorJson).addHeader("Content-Type", "application/json"));
 
         setupClientForMockServer();
+        // 429 is retryable; cap attempts at 1 so this asserts surfacing rather than retry behavior.
+        client.setTestConfig("retry.max", "1");
+        client.setTestConfig("retry.base.delay.ms", "0");
 
         final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
 
@@ -390,7 +393,11 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             client.chat(request);
             fail("Expected LlmException to be thrown");
         } catch (final LlmException error) {
-            assertTrue(error.getMessage().contains("429"));
+            // After retry exhaustion the LlmException wraps an IOException whose message contains the status code.
+            final Throwable cause = error.getCause();
+            assertNotNull(cause);
+            assertTrue("expected status code 429 in cause message: " + cause.getMessage(),
+                    cause.getMessage() != null && cause.getMessage().contains("429"));
         }
     }
 
@@ -408,6 +415,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         mockServer.enqueue(new MockResponse().setResponseCode(500).setBody(errorJson).addHeader("Content-Type", "application/json"));
 
         setupClientForMockServer();
+        // 500 is retryable; cap attempts at 1 to surface the failure immediately.
+        client.setTestConfig("retry.max", "1");
+        client.setTestConfig("retry.base.delay.ms", "0");
 
         final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
 
@@ -415,7 +425,10 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             client.chat(request);
             fail("Expected LlmException to be thrown");
         } catch (final LlmException error) {
-            assertTrue(error.getMessage().contains("500"));
+            final Throwable cause = error.getCause();
+            assertNotNull(cause);
+            assertTrue("expected status code 500 in cause message: " + cause.getMessage(),
+                    cause.getMessage() != null && cause.getMessage().contains("500"));
         }
     }
 
@@ -424,6 +437,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         mockServer.enqueue(new MockResponse().setResponseCode(503).setBody("").addHeader("Content-Type", "application/json"));
 
         setupClientForMockServer();
+        // 503 is retryable; cap attempts at 1 to surface the failure immediately.
+        client.setTestConfig("retry.max", "1");
+        client.setTestConfig("retry.base.delay.ms", "0");
 
         final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
 
@@ -431,7 +447,10 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             client.chat(request);
             fail("Expected LlmException to be thrown");
         } catch (final LlmException error) {
-            assertTrue(error.getMessage().contains("503"));
+            final Throwable cause = error.getCause();
+            assertNotNull(cause);
+            assertTrue("expected status code 503 in cause message: " + cause.getMessage(),
+                    cause.getMessage() != null && cause.getMessage().contains("503"));
         }
     }
 
@@ -502,6 +521,216 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertEquals(5, response.getPromptTokens());
         assertNull(response.getCompletionTokens());
         assertNull(response.getTotalTokens());
+    }
+
+    // ========== chat() retry/diagnostics tests (Task 10) ==========
+
+    @Test
+    public void test_chat_retriesOn429ThenSucceeds() throws Exception {
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "3");
+        client.setTestConfig("retry.base.delay.ms", "10");
+        mockServer.enqueue(new MockResponse().setResponseCode(429)
+                .addHeader("Content-Type", "application/json")
+                .setBody("{\"error\":{\"message\":\"rate limit\",\"type\":\"rate_limit_exceeded\"}}"));
+        mockServer.enqueue(new MockResponse().setResponseCode(200).setBody(simpleSuccessBody()));
+        final LlmChatResponse resp = client.chat(buildSimpleRequest());
+        assertEquals("ok", resp.getContent());
+        assertEquals(2, mockServer.getRequestCount());
+    }
+
+    @Test
+    public void test_chat_honorsRetryAfterHeader_429() throws Exception {
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "2");
+        client.setTestConfig("retry.base.delay.ms", "100000"); // huge backoff to detect override
+        mockServer.enqueue(new MockResponse().setResponseCode(429)
+                .addHeader("Retry-After", "0")
+                .setBody("{\"error\":{\"type\":\"rate_limit_exceeded\"}}"));
+        mockServer.enqueue(new MockResponse().setResponseCode(200).setBody(simpleSuccessBody()));
+        final long start = System.currentTimeMillis();
+        client.chat(buildSimpleRequest());
+        assertTrue("Retry-After=0 must override large backoff", System.currentTimeMillis() - start < 5000);
+    }
+
+    @Test
+    public void test_chat_honorsRetryAfterHeader_503() throws Exception {
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "2");
+        client.setTestConfig("retry.base.delay.ms", "100000");
+        mockServer.enqueue(new MockResponse().setResponseCode(503).addHeader("Retry-After", "0").setBody("{}"));
+        mockServer.enqueue(new MockResponse().setResponseCode(200).setBody(simpleSuccessBody()));
+        final long start = System.currentTimeMillis();
+        client.chat(buildSimpleRequest());
+        assertTrue(System.currentTimeMillis() - start < 5000);
+    }
+
+    @Test
+    public void test_chat_retryAfterHttpDate_fallsBackToBackoff() throws Exception {
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "2");
+        client.setTestConfig("retry.base.delay.ms", "10"); // tiny so backoff is fast
+        mockServer.enqueue(new MockResponse().setResponseCode(429).addHeader("Retry-After", "Wed, 21 Oct 2026 07:28:00 GMT").setBody("{}"));
+        mockServer.enqueue(new MockResponse().setResponseCode(200).setBody(simpleSuccessBody()));
+        client.chat(buildSimpleRequest());
+        assertEquals(2, mockServer.getRequestCount());
+    }
+
+    @Test
+    public void test_chat_doesNotRetry_400() throws Exception {
+        setupClientForMockServer();
+        mockServer.enqueue(new MockResponse().setResponseCode(400)
+                .setBody("{\"error\":{\"message\":\"bad request\",\"type\":\"invalid_request_error\"}}"));
+        try {
+            client.chat(buildSimpleRequest());
+            fail("expected LlmException");
+        } catch (final LlmException expected) {
+            assertEquals(1, mockServer.getRequestCount());
+        }
+    }
+
+    @Test
+    public void test_chat_retriesOn500_502_503_504() throws Exception {
+        for (final int status : new int[] { 500, 502, 503, 504 }) {
+            // Re-init fresh state for each iteration.
+            if (mockServer != null)
+                mockServer.shutdown();
+            mockServer = new MockWebServer();
+            mockServer.start();
+            client = new TestableOpenAiLlmClient();
+            setupClientForMockServer();
+            client.setTestConfig("retry.max", "2");
+            client.setTestConfig("retry.base.delay.ms", "10");
+            mockServer.enqueue(new MockResponse().setResponseCode(status).setBody("{}"));
+            mockServer.enqueue(new MockResponse().setResponseCode(200).setBody(simpleSuccessBody()));
+            client.chat(buildSimpleRequest());
+            assertEquals("status " + status + " must retry", 2, mockServer.getRequestCount());
+        }
+    }
+
+    @Test
+    public void test_chat_exhaustsRetries() throws Exception {
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "3");
+        client.setTestConfig("retry.base.delay.ms", "10");
+        for (int i = 0; i < 3; i++) {
+            mockServer.enqueue(new MockResponse().setResponseCode(503).setBody("{}"));
+        }
+        try {
+            client.chat(buildSimpleRequest());
+            fail("expected LlmException after retry exhaustion");
+        } catch (final LlmException expected) {
+            assertEquals(3, mockServer.getRequestCount());
+        }
+    }
+
+    @Test
+    public void test_chat_logsAbnormalFinishReason_length() throws Exception {
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(new MockResponse().setResponseCode(200)
+                    .setBody("{\"id\":\"chatcmpl-1\",\"model\":\"gpt-5-mini\","
+                            + "\"choices\":[{\"message\":{\"content\":\"truncated...\"},\"finish_reason\":\"length\"}],"
+                            + "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":50,\"total_tokens\":51}}"));
+            client.chat(buildSimpleRequest());
+            assertTrue("abnormal-finish WARN must include id and finishReason",
+                    app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                            .stream()
+                            .anyMatch(s -> s.contains("Chat finished abnormally") && s.contains("finishReason=length")
+                                    && s.contains("id=chatcmpl-1")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_chat_logsResponseIdAndUsageDetails() throws Exception {
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(new MockResponse().setResponseCode(200)
+                    .setBody("{\"id\":\"chatcmpl-9\",\"system_fingerprint\":\"fp_abc\",\"model\":\"gpt-5-mini\","
+                            + "\"choices\":[{\"message\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],"
+                            + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,"
+                            + "\"completion_tokens_details\":{\"reasoning_tokens\":3},"
+                            + "\"prompt_tokens_details\":{\"cached_tokens\":7}}}"));
+            client.chat(buildSimpleRequest());
+            final String line = app.messagesAt(org.apache.logging.log4j.Level.INFO)
+                    .stream()
+                    .filter(s -> s.contains("Chat response received"))
+                    .findFirst()
+                    .orElse("");
+            assertTrue("missing id: " + line, line.contains("id=chatcmpl-9"));
+            assertTrue("missing systemFingerprint: " + line, line.contains("systemFingerprint=fp_abc"));
+            assertTrue("missing reasoningTokens: " + line, line.contains("reasoningTokens=3"));
+            assertTrue("missing cachedTokens: " + line, line.contains("cachedTokens=7"));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_chat_oldModelWithoutSystemFingerprint() throws Exception {
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(new MockResponse().setResponseCode(200)
+                    .setBody("{\"id\":\"chatcmpl-x\",\"model\":\"gpt-3.5-turbo\","
+                            + "\"choices\":[{\"message\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],"
+                            + "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}"));
+            client.chat(buildSimpleRequest());
+            final String line = app.messagesAt(org.apache.logging.log4j.Level.INFO)
+                    .stream()
+                    .filter(s -> s.contains("Chat response received"))
+                    .findFirst()
+                    .orElse("");
+            assertTrue("INFO line must still fire when system_fingerprint absent", line.contains("systemFingerprint=null"));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_chat_errorBodyParsedIntoLog() throws Exception {
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(new MockResponse().setResponseCode(401)
+                    .setBody("{\"error\":{\"message\":\"Invalid API key\",\"type\":\"invalid_request_error\","
+                            + "\"code\":\"invalid_api_key\",\"param\":null}}"));
+            try {
+                client.chat(buildSimpleRequest());
+                fail();
+            } catch (final LlmException e) { /* expected */ }
+            assertTrue(app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                    .stream()
+                    .anyMatch(s -> s.contains("API error") && s.contains("type=invalid_request_error")
+                            && s.contains("code=invalid_api_key")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_chat_logsMaskedUrlOnError() throws Exception {
+        // Configure a credential-bearing URL; verify it's masked in logs.
+        client.setTestApiKey("sk-test");
+        client.setTestApiUrl(mockServer.url("/").toString().replaceAll("/$", "") + "?api_key=secret");
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(new MockResponse().setResponseCode(400).setBody("{\"error\":{}}"));
+            try {
+                client.chat(buildSimpleRequest());
+                fail();
+            } catch (final LlmException e) { /* expected */ }
+            assertTrue("URL must be masked",
+                    app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                            .stream()
+                            .anyMatch(s -> s.contains("api_key=***") && !s.contains("api_key=secret")));
+        } finally {
+            detachLogCapture(app);
+        }
     }
 
     // ========== streamChat() method tests ==========
@@ -1054,6 +1283,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         mockServer.enqueue(new MockResponse().setResponseCode(503).setBody("Service Unavailable"));
 
         setupClientForMockServer();
+        // 503 is retryable; cap attempts at 1 so this asserts surfacing rather than retry behavior.
+        client.setTestConfig("retry.max", "1");
+        client.setTestConfig("retry.base.delay.ms", "0");
 
         final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
 
@@ -1061,7 +1293,10 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             client.chat(request);
             fail("Expected LlmException to be thrown");
         } catch (final LlmException error) {
-            assertTrue(error.getMessage().contains("503"));
+            final Throwable cause = error.getCause();
+            assertNotNull(cause);
+            assertTrue("expected status code 503 in cause message: " + cause.getMessage(),
+                    cause.getMessage() != null && cause.getMessage().contains("503"));
         }
     }
 
