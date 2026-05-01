@@ -614,6 +614,32 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     }
 
     @Test
+    public void test_chat_retryAfterClamped_largeValueReducesTo600s() throws Exception {
+        // parseRetryAfterSeconds clamps any value > 600s down to 600s. With retry.max=1 the single
+        // attempt fails immediately (no real sleep) but the WARN line must record the clamped value
+        // proving the call site at OpenAiLlmClient.java:393-395 applies the clamp.
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "1");
+        client.setTestConfig("retry.base.delay.ms", "10");
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(new MockResponse().setResponseCode(503).addHeader("Retry-After", "99999").setBody("{}"));
+            try {
+                client.chat(buildSimpleRequest());
+                fail("expected LlmException after retry exhaustion");
+            } catch (final LlmException expected) {
+                assertEquals(LlmException.ERROR_SERVICE_UNAVAILABLE, expected.getErrorCode());
+            }
+            assertTrue("WARN must record retry exhaustion with clamped retryAfter=600s",
+                    app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                            .stream()
+                            .anyMatch(s -> s.contains("retry exhausted") && s.contains("retryAfter=600s")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
     public void test_chat_retryAfterHttpDate_fallsBackToBackoff() throws Exception {
         setupClientForMockServer();
         client.setTestConfig("retry.max", "2");
@@ -691,6 +717,41 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     }
 
     @Test
+    public void test_chat_exhaustsRetries_502PreservesServiceUnavailableCode() throws Exception {
+        // 502 must map to ERROR_SERVICE_UNAVAILABLE on retry exhaustion (not ERROR_CONNECTION).
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "2");
+        client.setTestConfig("retry.base.delay.ms", "10");
+        for (int i = 0; i < 2; i++) {
+            mockServer.enqueue(new MockResponse().setResponseCode(502).setBody("{}"));
+        }
+        try {
+            client.chat(buildSimpleRequest());
+            fail("expected LlmException after retry exhaustion");
+        } catch (final LlmException expected) {
+            assertEquals(LlmException.ERROR_SERVICE_UNAVAILABLE, expected.getErrorCode());
+        }
+    }
+
+    @Test
+    public void test_chat_exhaustsRetries_504MapsToUnknown() throws Exception {
+        // 504 is retryable but resolveErrorCode treats it as ERROR_UNKNOWN (only 502/503 map to
+        // SERVICE_UNAVAILABLE per the central mapping in AbstractLlmClient.resolveErrorCode).
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "2");
+        client.setTestConfig("retry.base.delay.ms", "10");
+        for (int i = 0; i < 2; i++) {
+            mockServer.enqueue(new MockResponse().setResponseCode(504).setBody("{}"));
+        }
+        try {
+            client.chat(buildSimpleRequest());
+            fail("expected LlmException after retry exhaustion");
+        } catch (final LlmException expected) {
+            assertEquals(LlmException.ERROR_UNKNOWN, expected.getErrorCode());
+        }
+    }
+
+    @Test
     public void test_chat_warnsOnMessageRefusal() throws Exception {
         // Non-streaming refusal must surface symmetrically with streamChat's delta.refusal handling
         // — otherwise refusal pairs with finish_reason=stop and null content and is silently logged
@@ -706,6 +767,59 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             assertTrue("WARN must include refusal text", app.messagesAt(org.apache.logging.log4j.Level.WARN)
                     .stream()
                     .anyMatch(s -> s.contains("Chat refusal") && s.contains("I cannot help with that") && s.contains("id=chatcmpl-r")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_chat_messageContentAndRefusalCoexist() throws Exception {
+        // When the assistant returns BOTH partial content and a refusal field with finish_reason=stop,
+        // the response content must still be exposed and the WARN must surface the refusal text.
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(new MockResponse().setResponseCode(200)
+                    .setBody("{\"id\":\"chatcmpl-mix\",\"model\":\"gpt-5-mini\","
+                            + "\"choices\":[{\"message\":{\"content\":\"partial answer\",\"refusal\":\"I cannot help with the rest\"},"
+                            + "\"finish_reason\":\"stop\"}]}"));
+            final LlmChatResponse resp = client.chat(buildSimpleRequest());
+            assertEquals("partial answer", resp.getContent());
+            assertTrue("WARN must surface refusal text", app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                    .stream()
+                    .anyMatch(
+                            s -> s.contains("Chat refusal") && s.contains("I cannot help with the rest") && s.contains("id=chatcmpl-mix")));
+            // INFO line should still report the actual content length (= "partial answer".length() = 14).
+            assertTrue("INFO line must report contentLength matching the visible content",
+                    app.messagesAt(org.apache.logging.log4j.Level.INFO)
+                            .stream()
+                            .anyMatch(s -> s.contains("Chat response received") && s.contains("contentLength=14")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_chat_messageContentFilterWithRefusal() throws Exception {
+        // content_filter finish reason combined with a refusal must fire BOTH the abnormal-finish WARN
+        // and the refusal WARN — they are independent diagnostics.
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(new MockResponse().setResponseCode(200)
+                    .setBody("{\"id\":\"chatcmpl-cf\",\"model\":\"gpt-5-mini\","
+                            + "\"choices\":[{\"message\":{\"content\":null,\"refusal\":\"Cannot comply with policy.\"},"
+                            + "\"finish_reason\":\"content_filter\"}]}"));
+            client.chat(buildSimpleRequest());
+            assertTrue("expected refusal WARN",
+                    app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                            .stream()
+                            .anyMatch(s -> s.contains("Chat refusal") && s.contains("Cannot comply with policy")));
+            assertTrue("expected abnormal-finish WARN with finishReason=content_filter",
+                    app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                            .stream()
+                            .anyMatch(s -> s.contains("Chat finished abnormally") && s.contains("finishReason=content_filter")
+                                    && s.contains("id=chatcmpl-cf")));
         } finally {
             detachLogCapture(app);
         }
@@ -834,6 +948,66 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         client.streamChat(buildSimpleRequest(), (content, done) -> collected.append(content));
         assertEquals("ok", collected.toString());
         assertEquals(2, mockServer.getRequestCount());
+    }
+
+    @Test
+    public void test_streamChat_exhaustsRetries_429PreservesRateLimitCode() throws Exception {
+        // Mirror chat()'s retry-exhaustion code preservation: streamChat() must surface the status-driven
+        // ERROR_RATE_LIMIT (not collapse to ERROR_CONNECTION) both via the thrown LlmException and via onError.
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "2");
+        client.setTestConfig("retry.base.delay.ms", "10");
+        for (int i = 0; i < 2; i++) {
+            mockServer.enqueue(new MockResponse().setResponseCode(429).setBody("{}"));
+        }
+        final java.util.concurrent.atomic.AtomicReference<Throwable> errorRef = new java.util.concurrent.atomic.AtomicReference<>();
+        try {
+            client.streamChat(buildSimpleRequest(), new LlmStreamCallback() {
+                @Override
+                public void onChunk(final String content, final boolean done) {
+                    fail("Should not receive chunks on retry exhaustion");
+                }
+
+                @Override
+                public void onError(final Throwable t) {
+                    errorRef.set(t);
+                }
+            });
+            fail("expected LlmException after retry exhaustion");
+        } catch (final LlmException expected) {
+            assertEquals(LlmException.ERROR_RATE_LIMIT, expected.getErrorCode());
+            assertTrue("onError must receive the same LlmException, not a collapsed ERROR_CONNECTION wrapper", expected == errorRef.get());
+        }
+    }
+
+    @Test
+    public void test_streamChat_exhaustsRetries_503PreservesServiceUnavailableCode() throws Exception {
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "2");
+        client.setTestConfig("retry.base.delay.ms", "10");
+        for (int i = 0; i < 2; i++) {
+            mockServer.enqueue(new MockResponse().setResponseCode(503).setBody("{}"));
+        }
+        final java.util.concurrent.atomic.AtomicReference<Throwable> errorRef = new java.util.concurrent.atomic.AtomicReference<>();
+        try {
+            client.streamChat(buildSimpleRequest(), new LlmStreamCallback() {
+                @Override
+                public void onChunk(final String content, final boolean done) {
+                    fail("Should not receive chunks on retry exhaustion");
+                }
+
+                @Override
+                public void onError(final Throwable t) {
+                    errorRef.set(t);
+                }
+            });
+            fail("expected LlmException after retry exhaustion");
+        } catch (final LlmException expected) {
+            assertEquals(LlmException.ERROR_SERVICE_UNAVAILABLE, expected.getErrorCode());
+            assertTrue("onError must receive the same LlmException, not a collapsed ERROR_CONNECTION wrapper", expected == errorRef.get());
+            assertTrue("onError throwable must also carry SERVICE_UNAVAILABLE", errorRef.get() instanceof LlmException
+                    && LlmException.ERROR_SERVICE_UNAVAILABLE.equals(((LlmException) errorRef.get()).getErrorCode()));
+        }
     }
 
     @Test
@@ -1021,6 +1195,57 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         } finally {
             detachLogCapture(app);
         }
+    }
+
+    @Test
+    public void test_streamChat_refusalConcatenatedAcrossChunks() throws Exception {
+        // refusal text split across multiple delta chunks must be concatenated in the WARN line
+        // (matches the implementation: lastRefusal = lastRefusal + r).
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            final String body = "data: {\"id\":\"chatcmpl-r1\",\"choices\":[{\"delta\":{\"refusal\":\"I \"},\"finish_reason\":null}]}\n\n"
+                    + "data: {\"id\":\"chatcmpl-r1\",\"choices\":[{\"delta\":{\"refusal\":\"cannot \"},\"finish_reason\":null}]}\n\n"
+                    + "data: {\"id\":\"chatcmpl-r1\",\"choices\":[{\"delta\":{\"refusal\":\"help.\"},\"finish_reason\":null}]}\n\n"
+                    + "data: {\"id\":\"chatcmpl-r1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" + "data: [DONE]\n\n";
+            mockServer.enqueue(new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(body));
+            client.streamChat(buildSimpleRequest(), (c, d) -> {});
+            assertTrue("WARN must contain joined refusal text", app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                    .stream()
+                    .anyMatch(s -> s.contains("Stream refusal") && s.contains("refusal=I cannot help.") && s.contains("id=chatcmpl-r1")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_streamChat_usageOnlyChunkDoesNotInvokeOnChunk() throws Exception {
+        // Usage-only chunk (choices=[]) carries token totals after finish_reason=stop. It must be
+        // parsed (StreamSummary.totalTokens populated) but must NOT trigger onChunk again.
+        setupClientForMockServer();
+        final java.util.concurrent.atomic.AtomicReference<OpenAiLlmClient.StreamSummary> summaryRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        client.setStreamSummaryConsumer(summaryRef::set);
+        final AtomicInteger nonEmptyCalls = new AtomicInteger();
+        final AtomicInteger doneCalls = new AtomicInteger();
+        final String body = "data: {\"id\":\"chatcmpl-u\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-u\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-u\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n"
+                + "data: [DONE]\n\n";
+        mockServer.enqueue(new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(body));
+        client.streamChat(buildSimpleRequest(), (content, done) -> {
+            if (!content.isEmpty()) {
+                nonEmptyCalls.incrementAndGet();
+            }
+            if (done) {
+                doneCalls.incrementAndGet();
+            }
+        });
+        assertEquals("only the content chunk should produce a non-empty onChunk call", 1, nonEmptyCalls.get());
+        assertEquals("done callback must fire exactly once", 1, doneCalls.get());
+        final OpenAiLlmClient.StreamSummary s = summaryRef.get();
+        assertNotNull(s, "StreamSummary must be captured");
+        assertEquals("totalTokens must come from the usage-only chunk", Integer.valueOf(7), s.totalTokens);
     }
 
     @Test
@@ -2651,6 +2876,21 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     @Test
     public void test_maskCredentialInUrl_null() {
         assertNull(OpenAiLlmClient.maskCredentialInUrl(null));
+    }
+
+    @Test
+    public void test_maskCredentialInUrl_multipleCredentialParams() {
+        // Proxies sometimes carry several credential-bearing query params (api_key, access_token, token).
+        // Every credential value must be replaced with *** while non-credential params are preserved.
+        final String masked =
+                OpenAiLlmClient.maskCredentialInUrl("https://proxy/v1/chat?api_key=secret1&model=gpt&access_token=secret2&token=secret3");
+        assertTrue("api_key must be masked: " + masked, masked.contains("api_key=***"));
+        assertTrue("access_token must be masked: " + masked, masked.contains("access_token=***"));
+        assertTrue("token must be masked: " + masked, masked.contains("token=***"));
+        assertFalse("api_key value must not leak: " + masked, masked.contains("secret1"));
+        assertFalse("access_token value must not leak: " + masked, masked.contains("secret2"));
+        assertFalse("token value must not leak: " + masked, masked.contains("secret3"));
+        assertTrue("non-credential param must be preserved: " + masked, masked.contains("model=gpt"));
     }
 
     // ========== retry config getter tests ==========
