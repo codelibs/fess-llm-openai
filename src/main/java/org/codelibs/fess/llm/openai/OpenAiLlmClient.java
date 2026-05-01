@@ -165,6 +165,8 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * {@code Retry-After} hints honored (each capped at 600s), the worst case approaches
      * {@code 9 * 600s = 90 min}. Tune down via this property when tighter latency bounds
      * are required.
+     *
+     * @return the maximum number of HTTP attempts (initial call plus retries).
      */
     protected int getRetryMaxAttempts() {
         return getConfigInt("retry.max", 10);
@@ -173,6 +175,8 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     /**
      * Returns the base delay in milliseconds for exponential backoff between retries.
      * Configured via {@code rag.llm.openai.retry.base.delay.ms} (default {@code 2000}).
+     *
+     * @return the base backoff delay in milliseconds.
      */
     protected long getRetryBaseDelayMs() {
         return Long.parseLong(ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + ".retry.base.delay.ms", "2000"));
@@ -183,6 +187,8 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * the final SSE chunk carries token usage. Default {@code true}; set to {@code false} for
      * OpenAI-compatible backends that reject the field. Configured via
      * {@code rag.llm.openai.stream.include.usage}.
+     *
+     * @return {@code true} when stream usage reporting should be requested.
      */
     protected boolean isStreamUsageEnabled() {
         return Boolean.parseBoolean(ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + ".stream.include.usage", "true"));
@@ -269,19 +275,22 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         throw lastParse;
     }
 
-    /**
-     * Renders an OpenAI error response body as a single-line diagnostic. Returns
-     * {@code "type=...,code=...,param=...,message=..."} when the body parses as the
-     * documented {@code {"error":{...}}} envelope; otherwise returns the body trimmed
-     * (clipped at 1024 chars + {@code "...(truncated)"} suffix) so non-JSON gateway
-     * pages remain readable in logs.
-     */
     private static final String ERROR_ENVELOPE_FIELD = "error";
     private static final String ERROR_FIELD_TYPE = "type";
     private static final String ERROR_FIELD_CODE = "code";
     private static final String ERROR_FIELD_PARAM = "param";
     private static final String ERROR_FIELD_MESSAGE = "message";
 
+    /**
+     * Renders an OpenAI error response body as a single-line diagnostic. Returns
+     * {@code "type=...,code=...,param=...,message=..."} when the body parses as the
+     * documented {@code {"error":{...}}} envelope; otherwise returns the body trimmed
+     * (clipped at 1024 chars + {@code "...(truncated)"} suffix) so non-JSON gateway
+     * pages remain readable in logs.
+     *
+     * @param errorBody the raw HTTP response body from a failed OpenAI API call.
+     * @return a single-line diagnostic suitable for logging.
+     */
     protected String extractErrorDetails(final String errorBody) {
         if (errorBody == null || errorBody.isEmpty()) {
             return "";
@@ -461,17 +470,29 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * Summary of a single streamChat invocation. Exposed for diagnostics, not part of the LLM SPI.
      */
     public static final class StreamSummary {
+        /** Number of SSE {@code data:} lines received (including the terminal usage chunk). */
         public final int chunkCount;
+        /** Number of parsed JSON chunk objects (excludes {@code [DONE]} and SSE comments). */
         public final int objectCount;
+        /** Final {@code finish_reason} reported by the server (e.g. {@code stop}, {@code length}). */
         public final String finishReason;
+        /** OpenAI response id ({@code id} field) for log correlation; {@code null} if absent. */
         public final String responseId;
+        /** OpenAI {@code system_fingerprint} for backend-version pinning; {@code null} if absent. */
         public final String systemFingerprint;
+        /** Prompt tokens reported by the terminal usage chunk; {@code null} if usage is disabled or omitted. */
         public final Integer promptTokens;
+        /** Cached prompt tokens ({@code prompt_tokens_details.cached_tokens}); {@code null} when absent. */
         public final Integer cachedTokens;
+        /** Completion tokens reported by the terminal usage chunk; {@code null} when absent. */
         public final Integer completionTokens;
+        /** Reasoning tokens ({@code completion_tokens_details.reasoning_tokens}); {@code null} for non-reasoning models. */
         public final Integer reasoningTokens;
+        /** Total tokens reported by the terminal usage chunk; {@code null} when absent. */
         public final Integer totalTokens;
+        /** Wall-clock milliseconds from request start to the first chunk arriving. */
         public final long firstChunkMs;
+        /** Wall-clock milliseconds for the full streaming call (request start to stream close). */
         public final long elapsedMs;
 
         StreamSummary(final int chunkCount, final int objectCount, final String finishReason, final String responseId,
