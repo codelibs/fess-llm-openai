@@ -17,11 +17,17 @@ package org.codelibs.fess.llm.openai;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.logging.log4j.core.LoggerContext;
+import org.apache.logging.log4j.core.appender.AbstractAppender;
+import org.apache.logging.log4j.core.config.LoggerConfig;
 import org.codelibs.fess.llm.LlmChatRequest;
 import org.codelibs.fess.llm.LlmChatResponse;
 import org.codelibs.fess.llm.LlmException;
@@ -1907,6 +1913,68 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     // ========== Helper methods ==========
 
+    private LlmChatRequest buildSimpleRequest() {
+        final LlmChatRequest req = new LlmChatRequest();
+        final List<LlmMessage> msgs = new ArrayList<>();
+        final LlmMessage m = new LlmMessage();
+        m.setRole("user");
+        m.setContent("hello");
+        msgs.add(m);
+        req.setMessages(msgs);
+        return req;
+    }
+
+    private String simpleSuccessBody() {
+        return "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-5-mini\","
+                + "\"choices\":[{\"message\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],"
+                + "\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}";
+    }
+
+    private String simpleStreamSseBody() {
+        return "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" + "data: [DONE]\n\n";
+    }
+
+    private static final class ListAppender extends AbstractAppender {
+        final List<LogEvent> events = new ArrayList<>();
+
+        ListAppender() {
+            super("ListAppender", null, null, true, null);
+        }
+
+        @Override
+        public void append(final LogEvent event) {
+            events.add(event.toImmutable());
+        }
+
+        List<String> messages() {
+            return events.stream().map(e -> e.getMessage().getFormattedMessage()).toList();
+        }
+
+        List<String> messagesAt(final org.apache.logging.log4j.Level level) {
+            return events.stream().filter(e -> e.getLevel().equals(level)).map(e -> e.getMessage().getFormattedMessage()).toList();
+        }
+    }
+
+    private ListAppender attachLogCapture() {
+        final ListAppender appender = new ListAppender();
+        appender.start();
+        final LoggerContext ctx = (LoggerContext) LogManager.getContext(false);
+        final LoggerConfig cfg = ctx.getConfiguration().getLoggerConfig("org.codelibs.fess.llm.openai.OpenAiLlmClient");
+        cfg.addAppender(appender, org.apache.logging.log4j.Level.DEBUG, null);
+        cfg.setLevel(org.apache.logging.log4j.Level.DEBUG);
+        ctx.updateLoggers();
+        return appender;
+    }
+
+    private void detachLogCapture(final ListAppender appender) {
+        final LoggerContext ctx = (LoggerContext) LogManager.getContext(false);
+        final LoggerConfig cfg = ctx.getConfiguration().getLoggerConfig("org.codelibs.fess.llm.openai.OpenAiLlmClient");
+        cfg.removeAppender(appender.getName());
+        ctx.updateLoggers();
+        appender.stop();
+    }
+
     private void setupClientForMockServer() {
         final String baseUrl = mockServer.url("").toString();
         // Remove trailing slash
@@ -2047,6 +2115,11 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         private Integer testProxyPort = null;
         private String testProxyUsername = "";
         private String testProxyPassword = "";
+        private final Map<String, String> testConfigOverrides = new HashMap<>();
+
+        void setTestConfig(final String suffixKey, final String value) {
+            testConfigOverrides.put(suffixKey, value);
+        }
 
         void setTestApiKey(final String apiKey) {
             this.testApiKey = apiKey;
