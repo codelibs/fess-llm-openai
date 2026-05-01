@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 import org.apache.hc.client5.http.classic.methods.HttpGet;
@@ -172,6 +173,87 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      */
     protected long getRetryBaseDelayMs() {
         return Long.parseLong(ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + ".retry.base.delay.ms", "2000"));
+    }
+
+    /**
+     * Internal signal thrown by the HTTP call body to indicate the received status code is
+     * retryable per {@link #isRetryableStatus(int)}. Caught by {@link #executeWithRetry};
+     * never escapes the client.
+     */
+    static final class RetryableHttpException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        final int statusCode;
+        final String reason;
+        /** Seconds parsed from {@code Retry-After}, or {@code -1} when absent/unparseable. */
+        final long retryAfterSeconds;
+
+        RetryableHttpException(final int statusCode, final String reason, final long retryAfterSeconds) {
+            super("retryable http error: " + statusCode + " " + reason);
+            this.statusCode = statusCode;
+            this.reason = reason;
+            this.retryAfterSeconds = retryAfterSeconds;
+        }
+    }
+
+    /** Functional interface for the retryable HTTP call body executed by {@link #executeWithRetry}. */
+    @FunctionalInterface
+    interface HttpCall<T> {
+        T call() throws IOException, ParseException;
+    }
+
+    /**
+     * Executes {@code call} with retry on {@link RetryableHttpException}. {@link IOException},
+     * {@link ParseException}, and {@link LlmException} (RuntimeException, NOT caught here -
+     * matches Gemini's contract: connect-failures and parse-failures are not retried because
+     * we cannot tell whether the request reached the server or not) all propagate immediately.
+     *
+     * <p>Backoff is exponential ({@code base * 2^(attempt-1)}) with +/-20% jitter, but a
+     * server-provided {@code Retry-After} (in seconds) takes precedence per OpenAI guidance.
+     *
+     * @param operation log label (e.g. {@code "chat"}).
+     * @param call the HTTP call body.
+     */
+    private <T> T executeWithRetry(final String operation, final HttpCall<T> call) throws IOException, ParseException {
+        final int maxAttempts = Math.max(1, getRetryMaxAttempts());
+        final long baseDelay = Math.max(0L, getRetryBaseDelayMs());
+        IOException lastIo = null;
+        ParseException lastParse = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return call.call();
+            } catch (final RetryableHttpException e) {
+                if (attempt == maxAttempts) {
+                    logger.warn("[LLM:OPENAI] {} retry exhausted. attempts={}, lastStatus={}, retryAfter={}s", operation, attempt,
+                            e.statusCode, e.retryAfterSeconds);
+                    throw new IOException("OpenAI API retryable error: " + e.statusCode + " " + e.reason, e);
+                }
+                final long delayMs;
+                if (e.retryAfterSeconds >= 0L) {
+                    delayMs = e.retryAfterSeconds * 1000L;
+                } else {
+                    final long jitter = (long) (baseDelay * 0.2 * ThreadLocalRandom.current().nextDouble(-1.0, 1.0));
+                    delayMs = (long) (baseDelay * Math.pow(2, attempt - 1)) + jitter;
+                }
+                logger.info("[LLM:OPENAI] {} retrying. attempt={}/{}, status={}, retryAfter={}s, sleepMs={}", operation, attempt,
+                        maxAttempts, e.statusCode, e.retryAfterSeconds, Math.max(0, delayMs));
+                try {
+                    Thread.sleep(Math.max(0, delayMs));
+                } catch (final InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Retry interrupted", ie);
+                }
+            } catch (final IOException e) {
+                lastIo = e;
+                break;
+            } catch (final ParseException e) {
+                lastParse = e;
+                break;
+            }
+        }
+        if (lastIo != null) {
+            throw lastIo;
+        }
+        throw lastParse;
     }
 
     @Override
