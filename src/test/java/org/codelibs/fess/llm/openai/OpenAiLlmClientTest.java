@@ -2092,6 +2092,32 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertNull(OpenAiLlmClient.maskCredentialInUrl(null));
     }
 
+    // ========== retry config getter tests ==========
+
+    @Test
+    public void test_getRetryMaxAttempts_default() {
+        final TestableOpenAiLlmClient bare = new TestableOpenAiLlmClient();
+        assertEquals(10, bare.getRetryMaxAttempts());
+    }
+
+    @Test
+    public void test_getRetryBaseDelayMs_default() {
+        final TestableOpenAiLlmClient bare = new TestableOpenAiLlmClient();
+        assertEquals(2000L, bare.getRetryBaseDelayMs());
+    }
+
+    @Test
+    public void test_getRetryMaxAttempts_overridden() {
+        client.setTestConfig("retry.max", "5");
+        assertEquals(5, client.getRetryMaxAttempts());
+    }
+
+    @Test
+    public void test_getRetryBaseDelayMs_overridden() {
+        client.setTestConfig("retry.base.delay.ms", "500");
+        assertEquals(500L, client.getRetryBaseDelayMs());
+    }
+
     // ========== Helper methods ==========
 
     private LlmChatRequest buildSimpleRequest() {
@@ -2300,6 +2326,18 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
         void setTestConfig(final String suffixKey, final String value) {
             testConfigOverrides.put(suffixKey, value);
+        }
+
+        @Override
+        protected int getRetryMaxAttempts() {
+            final String v = testConfigOverrides.get("retry.max");
+            return v != null ? Integer.parseInt(v) : super.getRetryMaxAttempts();
+        }
+
+        @Override
+        protected long getRetryBaseDelayMs() {
+            final String v = testConfigOverrides.get("retry.base.delay.ms");
+            return v != null ? Long.parseLong(v) : super.getRetryBaseDelayMs();
         }
 
         void setTestApiKey(final String apiKey) {

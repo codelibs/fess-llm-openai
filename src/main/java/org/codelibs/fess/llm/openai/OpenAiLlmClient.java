@@ -151,6 +151,29 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         return url.replaceAll("(?i)([?&](?:api[-_]?key|key|token|access[-_]?token)=)[^&]*", "$1***");
     }
 
+    /**
+     * Returns the maximum number of attempts (initial + retries) for a single HTTP call.
+     * Configured via {@code rag.llm.openai.retry.max} (default {@code 10}).
+     *
+     * <p>Worst-case sleep budget at default settings (base=2000ms, +/-20% jitter, no
+     * {@code Retry-After} server hint): {@code 2 + 4 + 8 + ... + 512} approx {@code 1022s}
+     * approx {@code 17 min} across 9 sleeps before the 10th attempt. With
+     * {@code Retry-After} hints honored (each capped at 600s), the worst case approaches
+     * {@code 9 * 600s = 90 min}. Tune down via this property when tighter latency bounds
+     * are required.
+     */
+    protected int getRetryMaxAttempts() {
+        return getConfigInt("retry.max", 10);
+    }
+
+    /**
+     * Returns the base delay in milliseconds for exponential backoff between retries.
+     * Configured via {@code rag.llm.openai.retry.base.delay.ms} (default {@code 2000}).
+     */
+    protected long getRetryBaseDelayMs() {
+        return Long.parseLong(ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + ".retry.base.delay.ms", "2000"));
+    }
+
     @Override
     public String getName() {
         return NAME;
