@@ -446,6 +446,49 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         }
     }
 
+    /**
+     * Summary of a single streamChat invocation. Exposed for diagnostics, not part of the LLM SPI.
+     */
+    public static final class StreamSummary {
+        public final int chunkCount;
+        public final int objectCount;
+        public final String finishReason;
+        public final String responseId;
+        public final String systemFingerprint;
+        public final Integer promptTokens;
+        public final Integer cachedTokens;
+        public final Integer completionTokens;
+        public final Integer reasoningTokens;
+        public final Integer totalTokens;
+        public final long firstChunkMs;
+        public final long elapsedMs;
+
+        StreamSummary(final int chunkCount, final int objectCount, final String finishReason, final String responseId,
+                final String systemFingerprint, final Integer promptTokens, final Integer cachedTokens, final Integer completionTokens,
+                final Integer reasoningTokens, final Integer totalTokens, final long firstChunkMs, final long elapsedMs) {
+            this.chunkCount = chunkCount;
+            this.objectCount = objectCount;
+            this.finishReason = finishReason;
+            this.responseId = responseId;
+            this.systemFingerprint = systemFingerprint;
+            this.promptTokens = promptTokens;
+            this.cachedTokens = cachedTokens;
+            this.completionTokens = completionTokens;
+            this.reasoningTokens = reasoningTokens;
+            this.totalTokens = totalTokens;
+            this.firstChunkMs = firstChunkMs;
+            this.elapsedMs = elapsedMs;
+        }
+    }
+
+    /** Test hook; not thread-safe. Set once before invoking streamChat from a single thread. */
+    private java.util.function.Consumer<StreamSummary> streamSummaryConsumer;
+
+    /** Test hook: receives the per-call {@link StreamSummary} right after the completion log line. */
+    void setStreamSummaryConsumer(final java.util.function.Consumer<StreamSummary> consumer) {
+        this.streamSummaryConsumer = consumer;
+    }
+
     @Override
     public void streamChat(final LlmChatRequest request, final LlmStreamCallback callback) {
         final String url = getApiUrl() + "/chat/completions";
