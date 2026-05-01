@@ -758,6 +758,199 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     // ========== streamChat() method tests ==========
 
     @Test
+    public void test_streamChat_retriesInitialConnectOn503() throws Exception {
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "2");
+        client.setTestConfig("retry.base.delay.ms", "10");
+        mockServer.enqueue(new MockResponse().setResponseCode(503).setBody("{}"));
+        mockServer.enqueue(
+                new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(simpleStreamSseBody()));
+        final StringBuilder collected = new StringBuilder();
+        client.streamChat(buildSimpleRequest(), (content, done) -> collected.append(content));
+        assertEquals("ok", collected.toString());
+        assertEquals(2, mockServer.getRequestCount());
+    }
+
+    @Test
+    public void test_streamChat_partialStreamErrorPropagates() throws Exception {
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "5");
+        client.setTestConfig("retry.base.delay.ms", "10");
+        // Truncated body — connection appears to drop mid-stream.
+        mockServer.enqueue(new MockResponse().setResponseCode(200)
+                .addHeader("Content-Type", "text/event-stream")
+                .setBody("data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hel"));
+        try {
+            client.streamChat(buildSimpleRequest(), (c, d) -> { /* swallow */ });
+        } catch (final LlmException e) { /* allowed */ }
+        assertEquals("partial-stream errors must NOT trigger retry", 1, mockServer.getRequestCount());
+    }
+
+    @Test
+    public void test_streamChat_capturesFinalUsageChunk_afterDoneChunk() throws Exception {
+        // Verifies the critical fix: usage chunk arrives after the done chunk and must be captured.
+        setupClientForMockServer();
+        final java.util.concurrent.atomic.AtomicReference<OpenAiLlmClient.StreamSummary> ref =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        client.setStreamSummaryConsumer(ref::set);
+        final String body = "data: {\"id\":\"chatcmpl-1\",\"system_fingerprint\":\"fp_abc\","
+                + "\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,"
+                + "\"completion_tokens\":1,\"total_tokens\":4,\"completion_tokens_details\":{\"reasoning_tokens\":2},"
+                + "\"prompt_tokens_details\":{\"cached_tokens\":1}}}\n\n" + "data: [DONE]\n\n";
+        mockServer.enqueue(new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(body));
+        client.streamChat(buildSimpleRequest(), (c, d) -> {});
+        final OpenAiLlmClient.StreamSummary s = ref.get();
+        assertNotNull(s);
+        assertEquals("chatcmpl-1", s.responseId);
+        assertEquals("fp_abc", s.systemFingerprint);
+        assertEquals("stop", s.finishReason);
+        assertEquals(Integer.valueOf(3), s.promptTokens);
+        assertEquals(Integer.valueOf(1), s.cachedTokens);
+        assertEquals(Integer.valueOf(1), s.completionTokens);
+        assertEquals(Integer.valueOf(2), s.reasoningTokens);
+        assertEquals(Integer.valueOf(4), s.totalTokens);
+    }
+
+    @Test
+    public void test_streamChat_doesNotDoubleFireDoneCallback() throws Exception {
+        // The done callback fires once on the finish_reason chunk; [DONE] must NOT re-fire it.
+        setupClientForMockServer();
+        final java.util.List<Boolean> doneSignals = new ArrayList<>();
+        final String body = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" + "data: [DONE]\n\n";
+        mockServer.enqueue(new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(body));
+        client.streamChat(buildSimpleRequest(), (c, d) -> {
+            if (d)
+                doneSignals.add(Boolean.TRUE);
+        });
+        assertEquals("done callback must fire exactly once", 1, doneSignals.size());
+    }
+
+    @Test
+    public void test_streamChat_finishReasonLength_warns() throws Exception {
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            final String body = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                    + "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" + "data: [DONE]\n\n";
+            mockServer.enqueue(new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(body));
+            client.streamChat(buildSimpleRequest(), (c, d) -> {});
+            assertTrue(app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                    .stream()
+                    .anyMatch(
+                            s -> s.contains("Stream finished abnormally") && s.contains("finishReason=length") && s.contains("chatcmpl-1")),
+                    "expected abnormal-finish WARN with finishReason=length and id");
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_streamChat_finishReasonContentFilter_warns() throws Exception {
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            final String body = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},"
+                    + "\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n";
+            mockServer.enqueue(new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(body));
+            client.streamChat(buildSimpleRequest(), (c, d) -> {});
+            assertTrue(
+                    app.messagesAt(org.apache.logging.log4j.Level.WARN).stream().anyMatch(s -> s.contains("finishReason=content_filter")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_streamChat_toleratesSseComments() throws Exception {
+        setupClientForMockServer();
+        final String body = ": ping\n\n: another\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" + "data: [DONE]\n\n";
+        mockServer.enqueue(new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(body));
+        final StringBuilder collected = new StringBuilder();
+        client.streamChat(buildSimpleRequest(), (c, d) -> collected.append(c));
+        assertEquals("x", collected.toString());
+    }
+
+    @Test
+    public void test_streamChat_initialRoleOnlyChunk_noEarlyChunk() throws Exception {
+        // First chunk has only delta.role; must not invoke onChunk.
+        setupClientForMockServer();
+        final java.util.concurrent.atomic.AtomicInteger contentCalls = new java.util.concurrent.atomic.AtomicInteger();
+        final String body = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" + "data: [DONE]\n\n";
+        mockServer.enqueue(new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(body));
+        client.streamChat(buildSimpleRequest(), (c, d) -> {
+            if (!c.isEmpty())
+                contentCalls.incrementAndGet();
+        });
+        assertEquals(1, contentCalls.get());
+    }
+
+    @Test
+    public void test_streamChat_logsHttpStatusAndContentTypeAtDebug() throws Exception {
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(
+                    new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(simpleStreamSseBody()));
+            client.streamChat(buildSimpleRequest(), (c, d) -> {});
+            assertTrue(
+                    app.messagesAt(org.apache.logging.log4j.Level.DEBUG)
+                            .stream()
+                            .anyMatch(s -> s.contains("statusCode=200") && s.contains("text/event-stream")),
+                    "expected DEBUG line with statusCode=200 and contentType");
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_streamChat_warnsOnDeltaRefusal() throws Exception {
+        // Structured-output refusal field: capture and WARN.
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            final String body = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"refusal\":\"I cannot help with that.\"},"
+                    + "\"finish_reason\":null}]}\n\n"
+                    + "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" + "data: [DONE]\n\n";
+            mockServer.enqueue(new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(body));
+            client.streamChat(buildSimpleRequest(), (c, d) -> {});
+            assertTrue(
+                    app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                            .stream()
+                            .anyMatch(s -> s.contains("refusal") && s.contains("I cannot help with that")),
+                    "WARN must include refusal text");
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_streamChat_noUsageChunk_summaryHasNullTokens() throws Exception {
+        // Compat backend that rejects stream_options: usage absent. StreamSummary tokens are null.
+        setupClientForMockServer();
+        client.setTestConfig("stream.include.usage", "false");
+        final java.util.concurrent.atomic.AtomicReference<OpenAiLlmClient.StreamSummary> ref =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        client.setStreamSummaryConsumer(ref::set);
+        mockServer.enqueue(
+                new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(simpleStreamSseBody()));
+        client.streamChat(buildSimpleRequest(), (c, d) -> {});
+        final OpenAiLlmClient.StreamSummary s = ref.get();
+        assertNotNull(s);
+        assertEquals("stop", s.finishReason);
+        assertNull(s.promptTokens);
+        assertNull(s.completionTokens);
+        assertNull(s.totalTokens);
+    }
+
+    @Test
     public void test_streamChat_success() throws IOException {
         final String sseResponse = """
                 data: {"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"}}]}
@@ -856,6 +1049,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         mockServer.enqueue(new MockResponse().setResponseCode(429).setBody(errorJson).addHeader("Content-Type", "application/json"));
 
         setupClientForMockServer();
+        // 429 is retryable; cap attempts at 1 so this asserts surfacing rather than retry behavior.
+        client.setTestConfig("retry.max", "1");
+        client.setTestConfig("retry.base.delay.ms", "0");
 
         final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
         final AtomicBoolean errorReceived = new AtomicBoolean(false);
@@ -874,7 +1070,11 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             });
             fail("Expected LlmException to be thrown");
         } catch (final LlmException error) {
-            assertTrue(error.getMessage().contains("429"));
+            // After retry exhaustion the LlmException wraps an IOException whose message contains the status code.
+            final Throwable cause = error.getCause();
+            assertNotNull(cause);
+            assertTrue(cause.getMessage() != null && cause.getMessage().contains("429"),
+                    "expected status code 429 in cause message: " + cause.getMessage());
             assertTrue(errorReceived.get());
         }
     }
@@ -892,6 +1092,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         mockServer.enqueue(new MockResponse().setResponseCode(500).setBody(errorJson).addHeader("Content-Type", "application/json"));
 
         setupClientForMockServer();
+        // 500 is retryable; cap attempts at 1 to surface the failure immediately.
+        client.setTestConfig("retry.max", "1");
+        client.setTestConfig("retry.base.delay.ms", "0");
 
         final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
         final AtomicBoolean errorReceived = new AtomicBoolean(false);
@@ -910,7 +1113,10 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             });
             fail("Expected LlmException to be thrown");
         } catch (final LlmException error) {
-            assertTrue(error.getMessage().contains("500"));
+            final Throwable cause = error.getCause();
+            assertNotNull(cause);
+            assertTrue(cause.getMessage() != null && cause.getMessage().contains("500"),
+                    "expected status code 500 in cause message: " + cause.getMessage());
             assertTrue(errorReceived.get());
         }
     }
@@ -1277,6 +1483,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         mockServer.enqueue(new MockResponse().setResponseCode(503).setBody("Service Unavailable"));
 
         setupClientForMockServer();
+        // 503 is retryable; cap attempts at 1 to surface the failure immediately.
+        client.setTestConfig("retry.max", "1");
+        client.setTestConfig("retry.base.delay.ms", "0");
 
         final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
         final AtomicBoolean errorReceived = new AtomicBoolean(false);
@@ -1295,7 +1504,10 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             });
             fail("Expected LlmException to be thrown");
         } catch (final LlmException error) {
-            assertTrue(error.getMessage().contains("503"));
+            final Throwable cause = error.getCause();
+            assertNotNull(cause);
+            assertTrue(cause.getMessage() != null && cause.getMessage().contains("503"),
+                    "expected status code 503 in cause message: " + cause.getMessage());
             assertTrue(errorReceived.get());
         }
     }

@@ -492,11 +492,12 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     @Override
     public void streamChat(final LlmChatRequest request, final LlmStreamCallback callback) {
         final String url = getApiUrl() + "/chat/completions";
+        final String maskedUrl = maskCredentialInUrl(url);
         final Map<String, Object> requestBody = buildRequestBody(request, true);
         final long startTime = System.currentTimeMillis();
 
         if (logger.isDebugEnabled()) {
-            logger.debug("[LLM:OPENAI] Starting streaming chat request to OpenAI. url={}, model={}, messageCount={}", url,
+            logger.debug("[LLM:OPENAI] Starting streaming chat request to OpenAI. url={}, model={}, messageCount={}", maskedUrl,
                     requestBody.get("model"), request.getMessages().size());
         }
 
@@ -509,86 +510,183 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             httpRequest.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON));
             httpRequest.addHeader("Authorization", "Bearer " + getApiKey());
 
-            try (var response = getHttpClient().execute(httpRequest)) {
-                final int statusCode = response.getCode();
-                if (statusCode < 200 || statusCode >= 300) {
-                    String errorBody = "";
-                    if (response.getEntity() != null) {
-                        try {
-                            errorBody = EntityUtils.toString(response.getEntity());
-                        } catch (final IOException | ParseException e) {
-                            // ignore
-                        }
+            executeWithRetry("streamChat", () -> {
+                try (var response = getHttpClient().execute(httpRequest)) {
+                    final int statusCode = response.getCode();
+                    if (logger.isDebugEnabled()) {
+                        final var ctHeader = response.getFirstHeader("Content-Type");
+                        logger.debug("[LLM:OPENAI] /chat/completions stream http response. statusCode={}, contentType={}", statusCode,
+                                ctHeader != null ? ctHeader.getValue() : null);
                     }
-                    logger.warn("[LLM:OPENAI] Streaming API error. url={}, statusCode={}, message={}, body={}", url, statusCode,
-                            response.getReasonPhrase(), errorBody);
-                    throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
-                            resolveErrorCode(statusCode));
-                }
-
-                if (response.getEntity() == null) {
-                    logger.warn("[LLM:OPENAI] Empty response from OpenAI streaming API. url={}", url);
-                    throw new LlmException("Empty response from OpenAI");
-                }
-
-                int chunkCount = 0;
-                long firstChunkTime = 0;
-                try (BufferedReader reader =
-                        new BufferedReader(new InputStreamReader(response.getEntity().getContent(), StandardCharsets.UTF_8))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        if (StringUtil.isBlank(line)) {
-                            continue;
+                    if (statusCode < 200 || statusCode >= 300) {
+                        String errorBody = "";
+                        if (response.getEntity() != null) {
+                            try {
+                                errorBody = EntityUtils.toString(response.getEntity());
+                            } catch (final IOException | ParseException e) { /* ignore */ }
                         }
-
-                        if (!line.startsWith(SSE_DATA_PREFIX)) {
-                            continue;
+                        final String errorDetails = extractErrorDetails(errorBody);
+                        logger.warn("[LLM:OPENAI] Streaming API error. url={}, statusCode={}, message={}, error={}", maskedUrl, statusCode,
+                                response.getReasonPhrase(), errorDetails);
+                        if (isRetryableStatus(statusCode)) {
+                            final var ra = response.getFirstHeader("Retry-After");
+                            final long retryAfter = parseRetryAfterSeconds(ra != null ? ra.getValue() : null);
+                            throw new RetryableHttpException(statusCode, response.getReasonPhrase(), retryAfter);
                         }
+                        throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
+                                resolveErrorCode(statusCode));
+                    }
+                    if (response.getEntity() == null) {
+                        logger.warn("[LLM:OPENAI] Empty response from OpenAI streaming API. url={}", maskedUrl);
+                        throw new LlmException("Empty response from OpenAI");
+                    }
 
-                        final String data = line.substring(SSE_DATA_PREFIX.length()).trim();
-                        if (SSE_DONE_MARKER.equals(data)) {
-                            callback.onChunk("", true);
-                            break;
-                        }
+                    int chunkCount = 0;
+                    int objectCount = 0;
+                    long firstChunkTime = 0;
+                    String lastResponseId = null;
+                    String lastSystemFingerprint = null;
+                    String lastFinishReason = null;
+                    String lastRefusal = null;
+                    Integer promptTokens = null;
+                    Integer cachedTokens = null;
+                    Integer completionTokens = null;
+                    Integer reasoningTokens = null;
+                    Integer totalTokens = null;
+                    boolean terminalCallbackSent = false;
 
-                        try {
-                            final JsonNode jsonNode = objectMapper.readTree(data);
-                            if (jsonNode.has("choices") && jsonNode.get("choices").isArray() && jsonNode.get("choices").size() > 0) {
-                                final JsonNode firstChoice = jsonNode.get("choices").get(0);
-                                final boolean done = firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull();
-
-                                if (firstChoice.has("delta") && firstChoice.get("delta").has("content")) {
-                                    final String content = firstChoice.get("delta").get("content").asText();
-                                    callback.onChunk(content, done);
-                                    if (chunkCount == 0) {
-                                        firstChunkTime = System.currentTimeMillis() - startTime;
-                                    }
-                                    chunkCount++;
-                                } else if (done) {
-                                    callback.onChunk("", true);
-                                }
-
-                                if (done) {
-                                    break;
-                                }
+                    try (BufferedReader reader =
+                            new BufferedReader(new InputStreamReader(response.getEntity().getContent(), StandardCharsets.UTF_8))) {
+                        String line;
+                        boolean streamDone = false;
+                        while (!streamDone && (line = reader.readLine()) != null) {
+                            if (StringUtil.isBlank(line)) {
+                                continue;
                             }
-                        } catch (final JsonProcessingException e) {
-                            logger.warn("[LLM:OPENAI] Failed to parse streaming response. line={}", line, e);
+                            if (line.charAt(0) == ':') {
+                                continue; // SSE comment
+                            }
+                            if (!line.startsWith(SSE_DATA_PREFIX)) {
+                                continue;
+                            }
+                            final String data = line.substring(SSE_DATA_PREFIX.length()).trim();
+                            if (SSE_DONE_MARKER.equals(data)) {
+                                if (!terminalCallbackSent) {
+                                    callback.onChunk("", true);
+                                    terminalCallbackSent = true;
+                                }
+                                streamDone = true;
+                                continue;
+                            }
+
+                            try {
+                                final JsonNode jsonNode = objectMapper.readTree(data);
+                                objectCount++;
+                                if (logger.isDebugEnabled()) {
+                                    logger.debug("[LLM:OPENAI] streamObject#{} json={}", objectCount, data);
+                                }
+                                if (lastResponseId == null && jsonNode.has("id") && !jsonNode.get("id").isNull()) {
+                                    lastResponseId = jsonNode.get("id").asText();
+                                }
+                                if (lastSystemFingerprint == null && jsonNode.has("system_fingerprint")
+                                        && !jsonNode.get("system_fingerprint").isNull()) {
+                                    lastSystemFingerprint = jsonNode.get("system_fingerprint").asText();
+                                }
+                                if (jsonNode.has("usage") && !jsonNode.get("usage").isNull()) {
+                                    final JsonNode u = jsonNode.get("usage");
+                                    if (u.has("prompt_tokens")) {
+                                        promptTokens = u.get("prompt_tokens").asInt();
+                                    }
+                                    if (u.has("completion_tokens")) {
+                                        completionTokens = u.get("completion_tokens").asInt();
+                                    }
+                                    if (u.has("total_tokens")) {
+                                        totalTokens = u.get("total_tokens").asInt();
+                                    }
+                                    if (u.has("completion_tokens_details") && u.get("completion_tokens_details").has("reasoning_tokens")) {
+                                        reasoningTokens = u.get("completion_tokens_details").get("reasoning_tokens").asInt();
+                                    }
+                                    if (u.has("prompt_tokens_details") && u.get("prompt_tokens_details").has("cached_tokens")) {
+                                        cachedTokens = u.get("prompt_tokens_details").get("cached_tokens").asInt();
+                                    }
+                                }
+                                if (jsonNode.has("choices") && jsonNode.get("choices").isArray() && jsonNode.get("choices").size() > 0) {
+                                    final JsonNode firstChoice = jsonNode.get("choices").get(0);
+                                    final boolean done = firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull();
+                                    if (done) {
+                                        lastFinishReason = firstChoice.get("finish_reason").asText();
+                                    }
+                                    final JsonNode delta = firstChoice.has("delta") ? firstChoice.get("delta") : null;
+                                    if (delta != null && delta.has("refusal") && !delta.get("refusal").isNull()) {
+                                        final String r = delta.get("refusal").asText();
+                                        lastRefusal = (lastRefusal == null) ? r : lastRefusal + r;
+                                    }
+                                    if (delta != null && delta.has("content") && !delta.get("content").isNull()) {
+                                        final String content = delta.get("content").asText();
+                                        callback.onChunk(content, done);
+                                        if (done) {
+                                            terminalCallbackSent = true;
+                                        }
+                                        if (chunkCount == 0) {
+                                            firstChunkTime = System.currentTimeMillis() - startTime;
+                                        }
+                                        chunkCount++;
+                                    } else if (done && !terminalCallbackSent) {
+                                        callback.onChunk("", true);
+                                        terminalCallbackSent = true;
+                                    }
+                                    // Continue reading even after done — usage chunk arrives next.
+                                }
+                                // Usage-only chunk has empty choices[]; size>0 guard above keeps callback silent.
+                            } catch (final JsonProcessingException e) {
+                                logger.warn("[LLM:OPENAI] Failed to parse streaming response. line={}", line, e);
+                            }
                         }
                     }
-                }
 
-                logger.info("[LLM:OPENAI] Stream completed. chunkCount={}, firstChunkMs={}, elapsedTime={}ms", chunkCount, firstChunkTime,
-                        System.currentTimeMillis() - startTime);
-            }
+                    final long elapsed = System.currentTimeMillis() - startTime;
+                    logger.info(
+                            "[LLM:OPENAI] Stream completed. chunkCount={}, objectCount={}, firstChunkMs={}, elapsedTime={}ms, "
+                                    + "id={}, systemFingerprint={}, finishReason={}, promptTokens={}, cachedTokens={}, "
+                                    + "completionTokens={}, reasoningTokens={}, totalTokens={}",
+                            chunkCount, objectCount, firstChunkTime, elapsed, lastResponseId, lastSystemFingerprint, lastFinishReason,
+                            promptTokens, cachedTokens, completionTokens, reasoningTokens, totalTokens);
+                    if (isAbnormalFinishReason(lastFinishReason)) {
+                        logger.warn(
+                                "[LLM:OPENAI] Stream finished abnormally. id={}, finishReason={}, chunkCount={}, "
+                                        + "completionTokens={}, reasoningTokens={}, model={}",
+                                lastResponseId, lastFinishReason, chunkCount, completionTokens, reasoningTokens, requestBody.get("model"));
+                    }
+                    if (lastRefusal != null) {
+                        logger.warn("[LLM:OPENAI] Stream refusal. id={}, refusal={}, model={}", lastResponseId, lastRefusal,
+                                requestBody.get("model"));
+                    }
+                    if (streamSummaryConsumer != null) {
+                        streamSummaryConsumer.accept(new StreamSummary(chunkCount, objectCount, lastFinishReason, lastResponseId,
+                                lastSystemFingerprint, promptTokens, cachedTokens, completionTokens, reasoningTokens, totalTokens,
+                                firstChunkTime, elapsed));
+                    }
+                    return null;
+                }
+            });
         } catch (final LlmException e) {
             callback.onError(e);
             throw e;
+        } catch (final RetryableHttpException e) {
+            // Defensive: executeWithRetry consumes RetryableHttpException; this should never fire.
+            final LlmException llm = new LlmException("OpenAI API retryable exhausted", LlmException.ERROR_CONNECTION, e);
+            callback.onError(llm);
+            throw llm;
         } catch (final IOException e) {
-            logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", url, e.getMessage(), e);
-            final LlmException llmException = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
-            callback.onError(llmException);
-            throw llmException;
+            logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
+            final LlmException llm = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
+            callback.onError(llm);
+            throw llm;
+        } catch (final ParseException e) {
+            logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
+            final LlmException llm = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
+            callback.onError(llm);
+            throw llm;
         }
     }
 
