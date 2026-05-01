@@ -107,6 +107,25 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     }
 
     @Test
+    public void test_isAvailable_logsMaskedUrlOnError() throws IOException {
+        // checkAvailabilityNow() must mask credential query params in DEBUG logs so a
+        // proxy URL like https://gw.example/v1?api_key=secret never leaks the key.
+        client.setTestApiKey("sk-test");
+        client.setTestApiUrl(mockServer.url("/").toString().replaceAll("/$", "") + "?api_key=secret");
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(new MockResponse().setResponseCode(401).setBody("{}"));
+            assertFalse(client.isAvailable());
+            assertTrue("availability DEBUG must mask credential",
+                    app.messagesAt(org.apache.logging.log4j.Level.DEBUG)
+                            .stream()
+                            .anyMatch(s -> s.contains("api_key=***") && !s.contains("api_key=secret")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
     public void test_convertMessage_user() {
         final LlmMessage message = LlmMessage.user("Hello, how are you?");
         final Map<String, String> result = client.convertMessage(message);
@@ -784,6 +803,33 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             client.streamChat(buildSimpleRequest(), (c, d) -> { /* swallow */ });
         } catch (final LlmException e) { /* allowed */ }
         assertEquals("partial-stream errors must NOT trigger retry", 1, mockServer.getRequestCount());
+    }
+
+    @Test
+    public void test_streamChat_callbackRuntimeException_invokesOnError() throws Exception {
+        // A RuntimeException thrown by the consumer's onChunk must surface via onError so
+        // consumers using the SPI's onError contract for cleanup don't silently leak.
+        setupClientForMockServer();
+        mockServer.enqueue(
+                new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(simpleStreamSseBody()));
+        final java.util.concurrent.atomic.AtomicReference<Throwable> errorRef = new java.util.concurrent.atomic.AtomicReference<>();
+        try {
+            client.streamChat(buildSimpleRequest(), new LlmStreamCallback() {
+                @Override
+                public void onChunk(final String content, final boolean done) {
+                    throw new RuntimeException("consumer boom");
+                }
+
+                @Override
+                public void onError(final Throwable t) {
+                    errorRef.set(t);
+                }
+            });
+            fail("expected propagation");
+        } catch (final LlmException expected) {
+            // ok
+        }
+        assertNotNull(errorRef.get(), "onError must fire when callback throws");
     }
 
     @Test

@@ -312,6 +312,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             }
             return false;
         }
+        final String maskedUrl = maskCredentialInUrl(apiUrl);
         try {
             final HttpGet request = new HttpGet(apiUrl + "/models");
             request.addHeader("Authorization", "Bearer " + apiKey);
@@ -319,14 +320,14 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                 final int statusCode = response.getCode();
                 final boolean available = statusCode >= 200 && statusCode < 300;
                 if (logger.isDebugEnabled()) {
-                    logger.debug("[LLM:OPENAI] OpenAI availability check. url={}, statusCode={}, available={}", apiUrl, statusCode,
+                    logger.debug("[LLM:OPENAI] OpenAI availability check. url={}, statusCode={}, available={}", maskedUrl, statusCode,
                             available);
                 }
                 return available;
             }
         } catch (final Exception e) {
             if (logger.isDebugEnabled()) {
-                logger.debug("[LLM:OPENAI] OpenAI is not available. url={}, error={}", apiUrl, e.getMessage());
+                logger.debug("[LLM:OPENAI] OpenAI is not available. url={}, error={}", maskedUrl, e.getMessage());
             }
             return false;
         }
@@ -683,6 +684,13 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             callback.onError(llm);
             throw llm;
         } catch (final ParseException e) {
+            logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
+            final LlmException llm = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
+            callback.onError(llm);
+            throw llm;
+        } catch (final RuntimeException e) {
+            // Mirrors chat()'s catch-all so unexpected runtime failures still notify the
+            // callback before propagating, preserving onError symmetry consumers may rely on.
             logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
             final LlmException llm = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
             callback.onError(llm);
