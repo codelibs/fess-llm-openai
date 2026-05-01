@@ -244,7 +244,11 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                 if (attempt == maxAttempts) {
                     logger.warn("[LLM:OPENAI] {} retry exhausted. attempts={}, lastStatus={}, retryAfter={}s", operation, attempt,
                             e.statusCode, e.retryAfterSeconds);
-                    throw new IOException("OpenAI API retryable error: " + e.statusCode + " " + e.reason, e);
+                    // Preserve the status-driven error code (429 -> rate_limit, 502/503 -> service_unavailable)
+                    // across retry exhaustion; otherwise the outer catch in chat()/streamChat() would degrade
+                    // every retryable failure to ERROR_CONNECTION and break downstream classification.
+                    throw new LlmException("OpenAI API retryable error: " + e.statusCode + " " + e.reason, resolveErrorCode(e.statusCode),
+                            e);
                 }
                 final long delayMs;
                 if (e.retryAfterSeconds >= 0L) {
@@ -402,11 +406,17 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                     final JsonNode jsonNode = objectMapper.readTree(responseBody);
 
                     final LlmChatResponse chatResponse = new LlmChatResponse();
+                    String refusal = null;
                     if (jsonNode.has("choices") && jsonNode.get("choices").isArray() && jsonNode.get("choices").size() > 0) {
                         final JsonNode firstChoice = jsonNode.get("choices").get(0);
-                        if (firstChoice.has("message") && firstChoice.get("message").has("content")
-                                && !firstChoice.get("message").get("content").isNull()) {
-                            chatResponse.setContent(firstChoice.get("message").get("content").asText());
+                        if (firstChoice.has("message")) {
+                            final JsonNode message = firstChoice.get("message");
+                            if (message.has("content") && !message.get("content").isNull()) {
+                                chatResponse.setContent(message.get("content").asText());
+                            }
+                            if (message.has("refusal") && !message.get("refusal").isNull()) {
+                                refusal = message.get("refusal").asText();
+                            }
                         }
                         if (firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull()) {
                             chatResponse.setFinishReason(firstChoice.get("finish_reason").asText());
@@ -451,6 +461,12 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                                         + "completionTokens={}, reasoningTokens={}, contentLength={}, model={}",
                                 responseId, chatResponse.getFinishReason(), chatResponse.getCompletionTokens(), reasoningTokens,
                                 chatResponse.getContent() != null ? chatResponse.getContent().length() : 0, chatResponse.getModel());
+                    }
+                    if (refusal != null) {
+                        // Mirror streamChat's WARN on delta.refusal: structured-output refusals can pair with
+                        // finish_reason=stop and null content, which would otherwise be silently logged as a
+                        // normal empty success.
+                        logger.warn("[LLM:OPENAI] Chat refusal. id={}, refusal={}, model={}", responseId, refusal, chatResponse.getModel());
                     }
                     return chatResponse;
                 }

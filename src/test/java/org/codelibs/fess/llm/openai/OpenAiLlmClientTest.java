@@ -434,11 +434,12 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             client.chat(request);
             fail("Expected LlmException to be thrown");
         } catch (final LlmException error) {
-            // After retry exhaustion the LlmException wraps an IOException whose message contains the status code.
+            // After retry exhaustion the LlmException wraps the RetryableHttpException whose message contains the status code.
             final Throwable cause = error.getCause();
             assertNotNull(cause);
             assertTrue("expected status code 429 in cause message: " + cause.getMessage(),
                     cause.getMessage() != null && cause.getMessage().contains("429"));
+            assertEquals("429 must surface as ERROR_RATE_LIMIT, not ERROR_CONNECTION", LlmException.ERROR_RATE_LIMIT, error.getErrorCode());
         }
     }
 
@@ -470,6 +471,8 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             assertNotNull(cause);
             assertTrue("expected status code 500 in cause message: " + cause.getMessage(),
                     cause.getMessage() != null && cause.getMessage().contains("500"));
+            // 500 maps to ERROR_UNKNOWN per resolveErrorCode (only 429/401/403/404/408/502/503 have explicit codes).
+            assertEquals(LlmException.ERROR_UNKNOWN, error.getErrorCode());
         }
     }
 
@@ -492,6 +495,8 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             assertNotNull(cause);
             assertTrue("expected status code 503 in cause message: " + cause.getMessage(),
                     cause.getMessage() != null && cause.getMessage().contains("503"));
+            assertEquals("503 must surface as ERROR_SERVICE_UNAVAILABLE, not ERROR_CONNECTION", LlmException.ERROR_SERVICE_UNAVAILABLE,
+                    error.getErrorCode());
         }
     }
 
@@ -664,6 +669,45 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             fail("expected LlmException after retry exhaustion");
         } catch (final LlmException expected) {
             assertEquals(3, mockServer.getRequestCount());
+            // Retry exhaustion must preserve the status-driven error code, not collapse to ERROR_CONNECTION.
+            assertEquals(LlmException.ERROR_SERVICE_UNAVAILABLE, expected.getErrorCode());
+        }
+    }
+
+    @Test
+    public void test_chat_exhaustsRetries_429PreservesRateLimitCode() throws Exception {
+        setupClientForMockServer();
+        client.setTestConfig("retry.max", "2");
+        client.setTestConfig("retry.base.delay.ms", "10");
+        for (int i = 0; i < 2; i++) {
+            mockServer.enqueue(new MockResponse().setResponseCode(429).setBody("{}"));
+        }
+        try {
+            client.chat(buildSimpleRequest());
+            fail("expected LlmException after retry exhaustion");
+        } catch (final LlmException expected) {
+            assertEquals(LlmException.ERROR_RATE_LIMIT, expected.getErrorCode());
+        }
+    }
+
+    @Test
+    public void test_chat_warnsOnMessageRefusal() throws Exception {
+        // Non-streaming refusal must surface symmetrically with streamChat's delta.refusal handling
+        // — otherwise refusal pairs with finish_reason=stop and null content and is silently logged
+        // as a normal empty success.
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            mockServer.enqueue(new MockResponse().setResponseCode(200)
+                    .setBody("{\"id\":\"chatcmpl-r\",\"model\":\"gpt-5-mini\","
+                            + "\"choices\":[{\"message\":{\"content\":null,\"refusal\":\"I cannot help with that.\"},"
+                            + "\"finish_reason\":\"stop\"}]}"));
+            client.chat(buildSimpleRequest());
+            assertTrue("WARN must include refusal text", app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                    .stream()
+                    .anyMatch(s -> s.contains("Chat refusal") && s.contains("I cannot help with that") && s.contains("id=chatcmpl-r")));
+        } finally {
+            detachLogCapture(app);
         }
     }
 
