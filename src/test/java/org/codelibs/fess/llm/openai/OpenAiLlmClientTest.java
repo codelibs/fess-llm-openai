@@ -1920,6 +1920,118 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         client.init();
     }
 
+    // ========== Proxy tests ==========
+
+    @Test
+    public void test_chat_throughProxy_withoutAuth() throws Exception {
+        // With a configured HTTP proxy, HttpClient sends the request to the proxy
+        // with an absolute-form request URI. We use a separate MockWebServer as the proxy
+        // and target a non-localhost address to verify routing.
+        final MockWebServer proxyServer = new MockWebServer();
+        try {
+            proxyServer.start();
+            final String responseJson = """
+                    {
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion",
+                        "model": "gpt-4",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }
+                    """;
+            proxyServer.enqueue(new MockResponse().setBody(responseJson).addHeader("Content-Type", "application/json"));
+
+            client.setTestApiUrl("http://openai.invalid/v1");
+            client.setTestApiKey("sk-test-key");
+            client.setTestModel("gpt-4");
+            client.setTestTimeout(30000);
+            client.setTestProxyHost(proxyServer.getHostName());
+            client.setTestProxyPort(proxyServer.getPort());
+            client.init();
+
+            final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+            final LlmChatResponse response = client.chat(request);
+            assertEquals("ok", response.getContent());
+
+            final RecordedRequest recorded = proxyServer.takeRequest();
+            assertTrue("Expected absolute-form URI starting with http://openai.invalid/, got: " + recorded.getRequestLine(),
+                    recorded.getRequestLine().contains("http://openai.invalid/"));
+            assertNull(recorded.getHeader("Proxy-Authorization"), "No proxy auth expected");
+        } finally {
+            proxyServer.shutdown();
+        }
+    }
+
+    @Test
+    public void test_chat_throughProxy_withBasicAuth() throws Exception {
+        final MockWebServer proxyServer = new MockWebServer();
+        try {
+            proxyServer.start();
+            // First response: 407 challenges the client to authenticate.
+            proxyServer
+                    .enqueue(new MockResponse().setResponseCode(407).addHeader("Proxy-Authenticate", "Basic realm=\"proxy\"").setBody(""));
+            // Second response: success after the client retries with credentials.
+            final String responseJson = """
+                    {
+                        "id": "chatcmpl-1",
+                        "object": "chat.completion",
+                        "model": "gpt-4",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }
+                    """;
+            proxyServer.enqueue(new MockResponse().setBody(responseJson).addHeader("Content-Type", "application/json"));
+
+            client.setTestApiUrl("http://openai.invalid/v1");
+            client.setTestApiKey("sk-test-key");
+            client.setTestModel("gpt-4");
+            client.setTestTimeout(30000);
+            client.setTestProxyHost(proxyServer.getHostName());
+            client.setTestProxyPort(proxyServer.getPort());
+            client.setTestProxyUsername("proxyuser");
+            client.setTestProxyPassword("proxypass");
+            client.init();
+
+            final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+            final LlmChatResponse response = client.chat(request);
+            assertEquals("ok", response.getContent());
+
+            final RecordedRequest first = proxyServer.takeRequest();
+            assertNull(first.getHeader("Proxy-Authorization"));
+            final RecordedRequest second = proxyServer.takeRequest();
+            final String auth = second.getHeader("Proxy-Authorization");
+            assertNotNull(auth, "Proxy-Authorization header expected on retry");
+            final String expected = "Basic "
+                    + java.util.Base64.getEncoder().encodeToString("proxyuser:proxypass".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            assertEquals(expected, auth);
+        } finally {
+            proxyServer.shutdown();
+        }
+    }
+
+    @Test
+    public void test_chat_noProxy_directConnection() throws Exception {
+        final String responseJson = """
+                {
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "model": "gpt-4",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "direct"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                }
+                """;
+        mockServer.enqueue(new MockResponse().setBody(responseJson).addHeader("Content-Type", "application/json"));
+        setupClientForMockServer();
+
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        final LlmChatResponse response = client.chat(request);
+        assertEquals("direct", response.getContent());
+
+        final RecordedRequest recorded = mockServer.takeRequest();
+        assertTrue("Expected origin-form request line, got: " + recorded.getRequestLine(),
+                recorded.getRequestLine().startsWith("POST /chat/completions"));
+    }
+
     /**
      * Testable subclass of OpenAiLlmClient that allows setting configuration values
      * directly without depending on FessConfig.
@@ -1931,6 +2043,10 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         private int testTimeout = 60000;
         private double testTemperature = 0.7;
         private int testMaxTokens = 4096;
+        private String testProxyHost = "";
+        private Integer testProxyPort = null;
+        private String testProxyUsername = "";
+        private String testProxyPassword = "";
 
         void setTestApiKey(final String apiKey) {
             this.testApiKey = apiKey;
@@ -1954,6 +2070,42 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
         void setTestMaxTokens(final int maxTokens) {
             this.testMaxTokens = maxTokens;
+        }
+
+        void setTestProxyHost(final String proxyHost) {
+            this.testProxyHost = proxyHost;
+        }
+
+        void setTestProxyPort(final Integer proxyPort) {
+            this.testProxyPort = proxyPort;
+        }
+
+        void setTestProxyUsername(final String proxyUsername) {
+            this.testProxyUsername = proxyUsername;
+        }
+
+        void setTestProxyPassword(final String proxyPassword) {
+            this.testProxyPassword = proxyPassword;
+        }
+
+        @Override
+        protected String getProxyHost() {
+            return testProxyHost;
+        }
+
+        @Override
+        protected Integer getProxyPort() {
+            return testProxyPort;
+        }
+
+        @Override
+        protected String getProxyUsername() {
+            return testProxyUsername;
+        }
+
+        @Override
+        protected String getProxyPassword() {
+            return testProxyPassword;
         }
 
         @Override
