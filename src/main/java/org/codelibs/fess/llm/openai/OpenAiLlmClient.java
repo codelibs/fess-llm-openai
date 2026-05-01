@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 import org.apache.hc.client5.http.classic.methods.HttpGet;
@@ -68,6 +69,251 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         // Default constructor
     }
 
+    /**
+     * Returns whether the given {@code finish_reason} indicates an abnormal completion.
+     *
+     * <p>For OpenAI, only {@code "stop"} (and absent / blank values) is nominal. All other
+     * values WARN, including:
+     * <ul>
+     *   <li>{@code "length"} - output was truncated by {@code max_tokens}.</li>
+     *   <li>{@code "content_filter"} - moderation removed content; raise to operators.</li>
+     *   <li>{@code "tool_calls"} / {@code "function_call"} - Fess RAG never enables tool /
+     *       function calling, so seeing these means a misconfiguration in
+     *       {@code extra_params}; surfacing them lets operators correct it.</li>
+     *   <li>Any future unknown value - surface so operators can update this client.</li>
+     * </ul>
+     */
+    static boolean isAbnormalFinishReason(final String reason) {
+        if (reason == null) {
+            return false;
+        }
+        final String trimmed = reason.trim();
+        if (trimmed.isEmpty() || "stop".equals(trimmed)) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Returns whether the given HTTP status code should be retried. Retryable: {@code 429}
+     * (rate limit), {@code 500} (server error), {@code 502} (bad gateway - OpenAI returns
+     * this under upstream overload), {@code 503} (service unavailable), {@code 504}
+     * (gateway timeout). All other statuses propagate immediately.
+     */
+    static boolean isRetryableStatus(final int statusCode) {
+        return statusCode == 429 || statusCode == 500 || statusCode == 502 || statusCode == 503 || statusCode == 504;
+    }
+
+    /** Maximum seconds we'll honor from a server-provided {@code Retry-After}. */
+    static final long RETRY_AFTER_CAP_SECONDS = 600L;
+
+    /**
+     * Parses an HTTP {@code Retry-After} header value as integer seconds. HTTP-date format
+     * is intentionally unsupported (returns {@code -1}) so the caller falls back to
+     * exponential backoff. Negative or non-numeric values also return {@code -1}.
+     * Values exceeding {@link #RETRY_AFTER_CAP_SECONDS} are clamped.
+     */
+    static long parseRetryAfterSeconds(final String value) {
+        if (value == null) {
+            return -1L;
+        }
+        final String trimmed = value.trim();
+        if (trimmed.isEmpty()) {
+            return -1L;
+        }
+        try {
+            final long seconds = Long.parseLong(trimmed);
+            if (seconds < 0) {
+                return -1L;
+            }
+            return Math.min(seconds, RETRY_AFTER_CAP_SECONDS);
+        } catch (final NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+    /**
+     * Masks credential-bearing query parameters in a URL. Strips values for keys
+     * {@code api_key}, {@code apikey}, {@code api-key}, {@code key}, {@code token},
+     * {@code access_token} (case-insensitive), replacing each value with {@code ***}.
+     *
+     * <p>OpenAI uses header authentication - the canonical {@code https://api.openai.com}
+     * URL does not contain credentials - but {@code rag.llm.openai.api.url} may point at
+     * proxies (Azure, vLLM, custom gateways) that do, so all log lines that include a URL
+     * route through this helper.
+     *
+     * @param url the URL to mask (may be {@code null}).
+     * @return the URL with credential values replaced by {@code ***}, or {@code null} when input is null.
+     */
+    private static final java.util.regex.Pattern CREDENTIAL_QUERY_PARAM_PATTERN =
+            java.util.regex.Pattern.compile("(?i)([?&](?:api[-_]?key|key|token|access[-_]?token)=)[^&]*");
+
+    static String maskCredentialInUrl(final String url) {
+        if (url == null) {
+            return null;
+        }
+        return CREDENTIAL_QUERY_PARAM_PATTERN.matcher(url).replaceAll("$1***");
+    }
+
+    /**
+     * Returns the maximum number of attempts (initial + retries) for a single HTTP call.
+     * Configured via {@code rag.llm.openai.retry.max} (default {@code 10}).
+     *
+     * <p>Worst-case sleep budget at default settings (base=2000ms, +/-20% jitter, no
+     * {@code Retry-After} server hint): {@code 2 + 4 + 8 + ... + 512} approx {@code 1022s}
+     * approx {@code 17 min} across 9 sleeps before the 10th attempt. With
+     * {@code Retry-After} hints honored (each capped at 600s), the worst case approaches
+     * {@code 9 * 600s = 90 min}. Tune down via this property when tighter latency bounds
+     * are required.
+     *
+     * @return the maximum number of HTTP attempts (initial call plus retries).
+     */
+    protected int getRetryMaxAttempts() {
+        return getConfigInt("retry.max", 10);
+    }
+
+    /**
+     * Returns the base delay in milliseconds for exponential backoff between retries.
+     * Configured via {@code rag.llm.openai.retry.base.delay.ms} (default {@code 2000}).
+     *
+     * @return the base backoff delay in milliseconds.
+     */
+    protected long getRetryBaseDelayMs() {
+        return Long.parseLong(ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + ".retry.base.delay.ms", "2000"));
+    }
+
+    /**
+     * Whether to opt in to {@code stream_options.include_usage=true} on streaming requests so
+     * the final SSE chunk carries token usage. Default {@code true}; set to {@code false} for
+     * OpenAI-compatible backends that reject the field. Configured via
+     * {@code rag.llm.openai.stream.include.usage}.
+     *
+     * @return {@code true} when stream usage reporting should be requested.
+     */
+    protected boolean isStreamUsageEnabled() {
+        return Boolean.parseBoolean(ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + ".stream.include.usage", "true"));
+    }
+
+    /**
+     * Internal signal thrown by the HTTP call body to indicate the received status code is
+     * retryable per {@link #isRetryableStatus(int)}. Caught by {@link #executeWithRetry};
+     * never escapes the client.
+     */
+    static final class RetryableHttpException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        final int statusCode;
+        final String reason;
+        /** Seconds parsed from {@code Retry-After}, or {@code -1} when absent/unparseable. */
+        final long retryAfterSeconds;
+
+        RetryableHttpException(final int statusCode, final String reason, final long retryAfterSeconds) {
+            super("retryable http error: " + statusCode + " " + reason);
+            this.statusCode = statusCode;
+            this.reason = reason;
+            this.retryAfterSeconds = retryAfterSeconds;
+        }
+    }
+
+    /** Functional interface for the retryable HTTP call body executed by {@link #executeWithRetry}. */
+    @FunctionalInterface
+    interface HttpCall<T> {
+        T call() throws IOException, ParseException;
+    }
+
+    /**
+     * Executes {@code call} with retry on {@link RetryableHttpException}. {@link IOException},
+     * {@link ParseException}, and {@link LlmException} (RuntimeException, NOT caught here -
+     * matches Gemini's contract: connect-failures and parse-failures are not retried because
+     * we cannot tell whether the request reached the server or not) all propagate immediately.
+     *
+     * <p>Backoff is exponential ({@code base * 2^(attempt-1)}) with +/-20% jitter, but a
+     * server-provided {@code Retry-After} (in seconds) takes precedence per OpenAI guidance.
+     *
+     * @param operation log label (e.g. {@code "chat"}).
+     * @param call the HTTP call body.
+     */
+    private <T> T executeWithRetry(final String operation, final HttpCall<T> call) throws IOException, ParseException {
+        final int maxAttempts = Math.max(1, getRetryMaxAttempts());
+        final long baseDelay = Math.max(0L, getRetryBaseDelayMs());
+        IOException lastIo = null;
+        ParseException lastParse = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return call.call();
+            } catch (final RetryableHttpException e) {
+                if (attempt == maxAttempts) {
+                    logger.warn("[LLM:OPENAI] {} retry exhausted. attempts={}, lastStatus={}, retryAfter={}s", operation, attempt,
+                            e.statusCode, e.retryAfterSeconds);
+                    // Preserve the status-driven error code (429 -> rate_limit, 502/503 -> service_unavailable)
+                    // across retry exhaustion; otherwise the outer catch in chat()/streamChat() would degrade
+                    // every retryable failure to ERROR_CONNECTION and break downstream classification.
+                    throw new LlmException("OpenAI API retryable error: " + e.statusCode + " " + e.reason, resolveErrorCode(e.statusCode),
+                            e);
+                }
+                final long delayMs;
+                if (e.retryAfterSeconds >= 0L) {
+                    delayMs = e.retryAfterSeconds * 1000L;
+                } else {
+                    final long jitter = (long) (baseDelay * 0.2 * ThreadLocalRandom.current().nextDouble(-1.0, 1.0));
+                    delayMs = (long) (baseDelay * Math.pow(2, attempt - 1)) + jitter;
+                }
+                logger.info("[LLM:OPENAI] {} retrying. attempt={}/{}, status={}, retryAfter={}s, sleepMs={}", operation, attempt,
+                        maxAttempts, e.statusCode, e.retryAfterSeconds, Math.max(0, delayMs));
+                try {
+                    Thread.sleep(Math.max(0, delayMs));
+                } catch (final InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Retry interrupted", ie);
+                }
+            } catch (final IOException e) {
+                lastIo = e;
+                break;
+            } catch (final ParseException e) {
+                lastParse = e;
+                break;
+            }
+        }
+        if (lastIo != null) {
+            throw lastIo;
+        }
+        throw lastParse;
+    }
+
+    private static final String ERROR_ENVELOPE_FIELD = "error";
+    private static final String ERROR_FIELD_TYPE = "type";
+    private static final String ERROR_FIELD_CODE = "code";
+    private static final String ERROR_FIELD_PARAM = "param";
+    private static final String ERROR_FIELD_MESSAGE = "message";
+
+    /**
+     * Renders an OpenAI error response body as a single-line diagnostic. Returns
+     * {@code "type=...,code=...,param=...,message=..."} when the body parses as the
+     * documented {@code {"error":{...}}} envelope; otherwise returns the body trimmed
+     * (clipped at 1024 chars + {@code "...(truncated)"} suffix) so non-JSON gateway
+     * pages remain readable in logs.
+     *
+     * @param errorBody the raw HTTP response body from a failed OpenAI API call.
+     * @return a single-line diagnostic suitable for logging.
+     */
+    protected String extractErrorDetails(final String errorBody) {
+        if (errorBody == null || errorBody.isEmpty()) {
+            return "";
+        }
+        try {
+            final JsonNode root = objectMapper.readTree(errorBody);
+            if (root.isObject() && root.has(ERROR_ENVELOPE_FIELD) && root.get(ERROR_ENVELOPE_FIELD).isObject()) {
+                final JsonNode err = root.get(ERROR_ENVELOPE_FIELD);
+                return String.format("%s=%s,%s=%s,%s=%s,%s=%s", ERROR_FIELD_TYPE, err.path(ERROR_FIELD_TYPE).asText("null"),
+                        ERROR_FIELD_CODE, err.path(ERROR_FIELD_CODE).asText("null"), ERROR_FIELD_PARAM,
+                        err.path(ERROR_FIELD_PARAM).asText("null"), ERROR_FIELD_MESSAGE, err.path(ERROR_FIELD_MESSAGE).asText("null"));
+            }
+        } catch (final JsonProcessingException e) {
+            // fall through to raw clip
+        }
+        final String trimmed = errorBody.trim();
+        return trimmed.length() > 1024 ? trimmed.substring(0, 1024) + "...(truncated)" : trimmed;
+    }
+
     @Override
     public String getName() {
         return NAME;
@@ -89,6 +335,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             }
             return false;
         }
+        final String maskedUrl = maskCredentialInUrl(apiUrl);
         try {
             final HttpGet request = new HttpGet(apiUrl + "/models");
             request.addHeader("Authorization", "Bearer " + apiKey);
@@ -96,14 +343,14 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                 final int statusCode = response.getCode();
                 final boolean available = statusCode >= 200 && statusCode < 300;
                 if (logger.isDebugEnabled()) {
-                    logger.debug("[LLM:OPENAI] OpenAI availability check. url={}, statusCode={}, available={}", apiUrl, statusCode,
+                    logger.debug("[LLM:OPENAI] OpenAI availability check. url={}, statusCode={}, available={}", maskedUrl, statusCode,
                             available);
                 }
                 return available;
             }
         } catch (final Exception e) {
             if (logger.isDebugEnabled()) {
-                logger.debug("[LLM:OPENAI] OpenAI is not available. url={}, error={}", apiUrl, e.getMessage());
+                logger.debug("[LLM:OPENAI] OpenAI is not available. url={}, error={}", maskedUrl, e.getMessage());
             }
             return false;
         }
@@ -112,12 +359,13 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     @Override
     public LlmChatResponse chat(final LlmChatRequest request) {
         final String url = getApiUrl() + "/chat/completions";
+        final String maskedUrl = maskCredentialInUrl(url);
         final Map<String, Object> requestBody = buildRequestBody(request, false);
         final long startTime = System.currentTimeMillis();
 
         if (logger.isDebugEnabled()) {
-            logger.debug("[LLM:OPENAI] Sending chat request to OpenAI. url={}, model={}, messageCount={}", url, requestBody.get("model"),
-                    request.getMessages().size());
+            logger.debug("[LLM:OPENAI] Sending chat request to OpenAI. url={}, model={}, messageCount={}", maskedUrl,
+                    requestBody.get("model"), request.getMessages().size());
         }
 
         try {
@@ -126,82 +374,178 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                 logger.debug("[LLM:OPENAI] requestBody={}", json);
             }
             final HttpPost httpRequest = new HttpPost(url);
-            httpRequest.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON));
+            httpRequest.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON)); // repeatable per HttpClient 5 contract
             httpRequest.addHeader("Authorization", "Bearer " + getApiKey());
 
-            try (var response = getHttpClient().execute(httpRequest)) {
-                final int statusCode = response.getCode();
-                if (statusCode < 200 || statusCode >= 300) {
-                    String errorBody = "";
-                    if (response.getEntity() != null) {
-                        try {
-                            errorBody = EntityUtils.toString(response.getEntity());
-                        } catch (final IOException e) {
-                            // ignore
+            return executeWithRetry("chat", () -> {
+                try (var response = getHttpClient().execute(httpRequest)) {
+                    final int statusCode = response.getCode();
+                    if (statusCode < 200 || statusCode >= 300) {
+                        String errorBody = "";
+                        if (response.getEntity() != null) {
+                            try {
+                                errorBody = EntityUtils.toString(response.getEntity());
+                            } catch (final IOException e) { /* ignore */ }
+                        }
+                        final String errorDetails = extractErrorDetails(errorBody);
+                        logger.warn("[LLM:OPENAI] API error. url={}, statusCode={}, message={}, error={}", maskedUrl, statusCode,
+                                response.getReasonPhrase(), errorDetails);
+                        if (isRetryableStatus(statusCode)) {
+                            final var ra = response.getFirstHeader("Retry-After");
+                            final long retryAfter = parseRetryAfterSeconds(ra != null ? ra.getValue() : null);
+                            throw new RetryableHttpException(statusCode, response.getReasonPhrase(), retryAfter);
+                        }
+                        throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
+                                resolveErrorCode(statusCode));
+                    }
+
+                    final String responseBody = response.getEntity() != null ? EntityUtils.toString(response.getEntity()) : "";
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("[LLM:OPENAI] responseBody={}", responseBody);
+                    }
+                    final JsonNode jsonNode = objectMapper.readTree(responseBody);
+
+                    final LlmChatResponse chatResponse = new LlmChatResponse();
+                    String refusal = null;
+                    if (jsonNode.has("choices") && jsonNode.get("choices").isArray() && jsonNode.get("choices").size() > 0) {
+                        final JsonNode firstChoice = jsonNode.get("choices").get(0);
+                        if (firstChoice.has("message")) {
+                            final JsonNode message = firstChoice.get("message");
+                            if (message.has("content") && !message.get("content").isNull()) {
+                                chatResponse.setContent(message.get("content").asText());
+                            }
+                            if (message.has("refusal") && !message.get("refusal").isNull()) {
+                                refusal = message.get("refusal").asText();
+                            }
+                        }
+                        if (firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull()) {
+                            chatResponse.setFinishReason(firstChoice.get("finish_reason").asText());
                         }
                     }
-                    logger.warn("[LLM:OPENAI] API error. url={}, statusCode={}, message={}, body={}", url, statusCode,
-                            response.getReasonPhrase(), errorBody);
-                    throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
-                            resolveErrorCode(statusCode));
-                }
+                    if (jsonNode.has("model")) {
+                        chatResponse.setModel(jsonNode.get("model").asText());
+                    }
+                    final String responseId = jsonNode.has("id") && !jsonNode.get("id").isNull() ? jsonNode.get("id").asText() : null;
+                    final String systemFingerprint = jsonNode.has("system_fingerprint") && !jsonNode.get("system_fingerprint").isNull()
+                            ? jsonNode.get("system_fingerprint").asText()
+                            : null;
+                    Integer reasoningTokens = null;
+                    Integer cachedTokens = null;
+                    if (jsonNode.has("usage")) {
+                        final JsonNode usage = jsonNode.get("usage");
+                        if (usage.has("prompt_tokens"))
+                            chatResponse.setPromptTokens(usage.get("prompt_tokens").asInt());
+                        if (usage.has("completion_tokens"))
+                            chatResponse.setCompletionTokens(usage.get("completion_tokens").asInt());
+                        if (usage.has("total_tokens"))
+                            chatResponse.setTotalTokens(usage.get("total_tokens").asInt());
+                        if (usage.has("completion_tokens_details") && usage.get("completion_tokens_details").has("reasoning_tokens")) {
+                            reasoningTokens = usage.get("completion_tokens_details").get("reasoning_tokens").asInt();
+                        }
+                        if (usage.has("prompt_tokens_details") && usage.get("prompt_tokens_details").has("cached_tokens")) {
+                            cachedTokens = usage.get("prompt_tokens_details").get("cached_tokens").asInt();
+                        }
+                    }
 
-                final String responseBody = response.getEntity() != null ? EntityUtils.toString(response.getEntity()) : "";
-                if (logger.isDebugEnabled()) {
-                    logger.debug("[LLM:OPENAI] responseBody={}", responseBody);
+                    logger.info(
+                            "[LLM:OPENAI] Chat response received. model={}, id={}, systemFingerprint={}, "
+                                    + "promptTokens={}, cachedTokens={}, completionTokens={}, reasoningTokens={}, "
+                                    + "totalTokens={}, finishReason={}, contentLength={}, elapsedTime={}ms",
+                            chatResponse.getModel(), responseId, systemFingerprint, chatResponse.getPromptTokens(), cachedTokens,
+                            chatResponse.getCompletionTokens(), reasoningTokens, chatResponse.getTotalTokens(),
+                            chatResponse.getFinishReason(), chatResponse.getContent() != null ? chatResponse.getContent().length() : 0,
+                            System.currentTimeMillis() - startTime);
+                    if (isAbnormalFinishReason(chatResponse.getFinishReason())) {
+                        logger.warn(
+                                "[LLM:OPENAI] Chat finished abnormally. id={}, finishReason={}, "
+                                        + "completionTokens={}, reasoningTokens={}, contentLength={}, model={}",
+                                responseId, chatResponse.getFinishReason(), chatResponse.getCompletionTokens(), reasoningTokens,
+                                chatResponse.getContent() != null ? chatResponse.getContent().length() : 0, chatResponse.getModel());
+                    }
+                    if (refusal != null) {
+                        // Mirror streamChat's WARN on delta.refusal: structured-output refusals can pair with
+                        // finish_reason=stop and null content, which would otherwise be silently logged as a
+                        // normal empty success.
+                        logger.warn("[LLM:OPENAI] Chat refusal. id={}, refusal={}, model={}", responseId, refusal, chatResponse.getModel());
+                    }
+                    return chatResponse;
                 }
-                final JsonNode jsonNode = objectMapper.readTree(responseBody);
-
-                final LlmChatResponse chatResponse = new LlmChatResponse();
-                if (jsonNode.has("choices") && jsonNode.get("choices").isArray() && jsonNode.get("choices").size() > 0) {
-                    final JsonNode firstChoice = jsonNode.get("choices").get(0);
-                    if (firstChoice.has("message") && firstChoice.get("message").has("content")) {
-                        chatResponse.setContent(firstChoice.get("message").get("content").asText());
-                    }
-                    if (firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull()) {
-                        chatResponse.setFinishReason(firstChoice.get("finish_reason").asText());
-                    }
-                }
-                if (jsonNode.has("model")) {
-                    chatResponse.setModel(jsonNode.get("model").asText());
-                }
-                if (jsonNode.has("usage")) {
-                    final JsonNode usage = jsonNode.get("usage");
-                    if (usage.has("prompt_tokens")) {
-                        chatResponse.setPromptTokens(usage.get("prompt_tokens").asInt());
-                    }
-                    if (usage.has("completion_tokens")) {
-                        chatResponse.setCompletionTokens(usage.get("completion_tokens").asInt());
-                    }
-                    if (usage.has("total_tokens")) {
-                        chatResponse.setTotalTokens(usage.get("total_tokens").asInt());
-                    }
-                }
-
-                logger.info(
-                        "[LLM:OPENAI] Chat response received. model={}, promptTokens={}, completionTokens={}, totalTokens={}, contentLength={}, elapsedTime={}ms",
-                        chatResponse.getModel(), chatResponse.getPromptTokens(), chatResponse.getCompletionTokens(),
-                        chatResponse.getTotalTokens(), chatResponse.getContent() != null ? chatResponse.getContent().length() : 0,
-                        System.currentTimeMillis() - startTime);
-
-                return chatResponse;
-            }
+            });
         } catch (final LlmException e) {
             throw e;
+        } catch (final RetryableHttpException e) {
+            // Defensive: executeWithRetry consumes RetryableHttpException; this should never fire.
+            throw new LlmException("OpenAI API retryable exhausted", LlmException.ERROR_CONNECTION, e);
         } catch (final Exception e) {
-            logger.warn("[LLM:OPENAI] Failed to call OpenAI API. url={}, error={}", url, e.getMessage(), e);
+            logger.warn("[LLM:OPENAI] Failed to call OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
             throw new LlmException("Failed to call OpenAI API", LlmException.ERROR_CONNECTION, e);
         }
+    }
+
+    /**
+     * Summary of a single streamChat invocation. Exposed for diagnostics, not part of the LLM SPI.
+     */
+    public static final class StreamSummary {
+        /** Number of SSE {@code data:} lines received (including the terminal usage chunk). */
+        public final int chunkCount;
+        /** Number of parsed JSON chunk objects (excludes {@code [DONE]} and SSE comments). */
+        public final int objectCount;
+        /** Final {@code finish_reason} reported by the server (e.g. {@code stop}, {@code length}). */
+        public final String finishReason;
+        /** OpenAI response id ({@code id} field) for log correlation; {@code null} if absent. */
+        public final String responseId;
+        /** OpenAI {@code system_fingerprint} for backend-version pinning; {@code null} if absent. */
+        public final String systemFingerprint;
+        /** Prompt tokens reported by the terminal usage chunk; {@code null} if usage is disabled or omitted. */
+        public final Integer promptTokens;
+        /** Cached prompt tokens ({@code prompt_tokens_details.cached_tokens}); {@code null} when absent. */
+        public final Integer cachedTokens;
+        /** Completion tokens reported by the terminal usage chunk; {@code null} when absent. */
+        public final Integer completionTokens;
+        /** Reasoning tokens ({@code completion_tokens_details.reasoning_tokens}); {@code null} for non-reasoning models. */
+        public final Integer reasoningTokens;
+        /** Total tokens reported by the terminal usage chunk; {@code null} when absent. */
+        public final Integer totalTokens;
+        /** Wall-clock milliseconds from request start to the first chunk arriving. */
+        public final long firstChunkMs;
+        /** Wall-clock milliseconds for the full streaming call (request start to stream close). */
+        public final long elapsedMs;
+
+        StreamSummary(final int chunkCount, final int objectCount, final String finishReason, final String responseId,
+                final String systemFingerprint, final Integer promptTokens, final Integer cachedTokens, final Integer completionTokens,
+                final Integer reasoningTokens, final Integer totalTokens, final long firstChunkMs, final long elapsedMs) {
+            this.chunkCount = chunkCount;
+            this.objectCount = objectCount;
+            this.finishReason = finishReason;
+            this.responseId = responseId;
+            this.systemFingerprint = systemFingerprint;
+            this.promptTokens = promptTokens;
+            this.cachedTokens = cachedTokens;
+            this.completionTokens = completionTokens;
+            this.reasoningTokens = reasoningTokens;
+            this.totalTokens = totalTokens;
+            this.firstChunkMs = firstChunkMs;
+            this.elapsedMs = elapsedMs;
+        }
+    }
+
+    /** Test hook; not thread-safe. Set once before invoking streamChat from a single thread. */
+    private java.util.function.Consumer<StreamSummary> streamSummaryConsumer;
+
+    /** Test hook: receives the per-call {@link StreamSummary} right after the completion log line. */
+    void setStreamSummaryConsumer(final java.util.function.Consumer<StreamSummary> consumer) {
+        this.streamSummaryConsumer = consumer;
     }
 
     @Override
     public void streamChat(final LlmChatRequest request, final LlmStreamCallback callback) {
         final String url = getApiUrl() + "/chat/completions";
+        final String maskedUrl = maskCredentialInUrl(url);
         final Map<String, Object> requestBody = buildRequestBody(request, true);
         final long startTime = System.currentTimeMillis();
 
         if (logger.isDebugEnabled()) {
-            logger.debug("[LLM:OPENAI] Starting streaming chat request to OpenAI. url={}, model={}, messageCount={}", url,
+            logger.debug("[LLM:OPENAI] Starting streaming chat request to OpenAI. url={}, model={}, messageCount={}", maskedUrl,
                     requestBody.get("model"), request.getMessages().size());
         }
 
@@ -214,86 +558,180 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             httpRequest.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON));
             httpRequest.addHeader("Authorization", "Bearer " + getApiKey());
 
-            try (var response = getHttpClient().execute(httpRequest)) {
-                final int statusCode = response.getCode();
-                if (statusCode < 200 || statusCode >= 300) {
-                    String errorBody = "";
-                    if (response.getEntity() != null) {
-                        try {
-                            errorBody = EntityUtils.toString(response.getEntity());
-                        } catch (final IOException | ParseException e) {
-                            // ignore
-                        }
+            executeWithRetry("streamChat", () -> {
+                try (var response = getHttpClient().execute(httpRequest)) {
+                    final int statusCode = response.getCode();
+                    if (logger.isDebugEnabled()) {
+                        final var ctHeader = response.getFirstHeader("Content-Type");
+                        logger.debug("[LLM:OPENAI] /chat/completions stream http response. statusCode={}, contentType={}", statusCode,
+                                ctHeader != null ? ctHeader.getValue() : null);
                     }
-                    logger.warn("[LLM:OPENAI] Streaming API error. url={}, statusCode={}, message={}, body={}", url, statusCode,
-                            response.getReasonPhrase(), errorBody);
-                    throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
-                            resolveErrorCode(statusCode));
-                }
-
-                if (response.getEntity() == null) {
-                    logger.warn("[LLM:OPENAI] Empty response from OpenAI streaming API. url={}", url);
-                    throw new LlmException("Empty response from OpenAI");
-                }
-
-                int chunkCount = 0;
-                long firstChunkTime = 0;
-                try (BufferedReader reader =
-                        new BufferedReader(new InputStreamReader(response.getEntity().getContent(), StandardCharsets.UTF_8))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        if (StringUtil.isBlank(line)) {
-                            continue;
+                    if (statusCode < 200 || statusCode >= 300) {
+                        String errorBody = "";
+                        if (response.getEntity() != null) {
+                            try {
+                                errorBody = EntityUtils.toString(response.getEntity());
+                            } catch (final IOException | ParseException e) { /* ignore */ }
                         }
-
-                        if (!line.startsWith(SSE_DATA_PREFIX)) {
-                            continue;
+                        final String errorDetails = extractErrorDetails(errorBody);
+                        logger.warn("[LLM:OPENAI] Streaming API error. url={}, statusCode={}, message={}, error={}", maskedUrl, statusCode,
+                                response.getReasonPhrase(), errorDetails);
+                        if (isRetryableStatus(statusCode)) {
+                            final var ra = response.getFirstHeader("Retry-After");
+                            final long retryAfter = parseRetryAfterSeconds(ra != null ? ra.getValue() : null);
+                            throw new RetryableHttpException(statusCode, response.getReasonPhrase(), retryAfter);
                         }
+                        throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
+                                resolveErrorCode(statusCode));
+                    }
+                    if (response.getEntity() == null) {
+                        logger.warn("[LLM:OPENAI] Empty response from OpenAI streaming API. url={}", maskedUrl);
+                        throw new LlmException("Empty response from OpenAI");
+                    }
 
-                        final String data = line.substring(SSE_DATA_PREFIX.length()).trim();
-                        if (SSE_DONE_MARKER.equals(data)) {
-                            callback.onChunk("", true);
-                            break;
-                        }
+                    int chunkCount = 0;
+                    int objectCount = 0;
+                    long firstChunkTime = 0;
+                    String lastResponseId = null;
+                    String lastSystemFingerprint = null;
+                    String lastFinishReason = null;
+                    String lastRefusal = null;
+                    Integer promptTokens = null;
+                    Integer cachedTokens = null;
+                    Integer completionTokens = null;
+                    Integer reasoningTokens = null;
+                    Integer totalTokens = null;
+                    boolean terminalCallbackSent = false;
 
-                        try {
-                            final JsonNode jsonNode = objectMapper.readTree(data);
-                            if (jsonNode.has("choices") && jsonNode.get("choices").isArray() && jsonNode.get("choices").size() > 0) {
-                                final JsonNode firstChoice = jsonNode.get("choices").get(0);
-                                final boolean done = firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull();
-
-                                if (firstChoice.has("delta") && firstChoice.get("delta").has("content")) {
-                                    final String content = firstChoice.get("delta").get("content").asText();
-                                    callback.onChunk(content, done);
-                                    if (chunkCount == 0) {
-                                        firstChunkTime = System.currentTimeMillis() - startTime;
-                                    }
-                                    chunkCount++;
-                                } else if (done) {
-                                    callback.onChunk("", true);
-                                }
-
-                                if (done) {
-                                    break;
-                                }
+                    try (BufferedReader reader =
+                            new BufferedReader(new InputStreamReader(response.getEntity().getContent(), StandardCharsets.UTF_8))) {
+                        String line;
+                        boolean streamDone = false;
+                        while (!streamDone && (line = reader.readLine()) != null) {
+                            if (StringUtil.isBlank(line)) {
+                                continue;
                             }
-                        } catch (final JsonProcessingException e) {
-                            logger.warn("[LLM:OPENAI] Failed to parse streaming response. line={}", line, e);
+                            if (line.charAt(0) == ':') {
+                                continue; // SSE comment
+                            }
+                            if (!line.startsWith(SSE_DATA_PREFIX)) {
+                                continue;
+                            }
+                            final String data = line.substring(SSE_DATA_PREFIX.length()).trim();
+                            if (SSE_DONE_MARKER.equals(data)) {
+                                if (!terminalCallbackSent) {
+                                    callback.onChunk("", true);
+                                    terminalCallbackSent = true;
+                                }
+                                streamDone = true;
+                                continue;
+                            }
+
+                            try {
+                                final JsonNode jsonNode = objectMapper.readTree(data);
+                                objectCount++;
+                                if (logger.isDebugEnabled()) {
+                                    logger.debug("[LLM:OPENAI] streamObject#{} json={}", objectCount, data);
+                                }
+                                if (lastResponseId == null && jsonNode.has("id") && !jsonNode.get("id").isNull()) {
+                                    lastResponseId = jsonNode.get("id").asText();
+                                }
+                                if (lastSystemFingerprint == null && jsonNode.has("system_fingerprint")
+                                        && !jsonNode.get("system_fingerprint").isNull()) {
+                                    lastSystemFingerprint = jsonNode.get("system_fingerprint").asText();
+                                }
+                                if (jsonNode.has("usage") && !jsonNode.get("usage").isNull()) {
+                                    final JsonNode u = jsonNode.get("usage");
+                                    if (u.has("prompt_tokens")) {
+                                        promptTokens = u.get("prompt_tokens").asInt();
+                                    }
+                                    if (u.has("completion_tokens")) {
+                                        completionTokens = u.get("completion_tokens").asInt();
+                                    }
+                                    if (u.has("total_tokens")) {
+                                        totalTokens = u.get("total_tokens").asInt();
+                                    }
+                                    if (u.has("completion_tokens_details") && u.get("completion_tokens_details").has("reasoning_tokens")) {
+                                        reasoningTokens = u.get("completion_tokens_details").get("reasoning_tokens").asInt();
+                                    }
+                                    if (u.has("prompt_tokens_details") && u.get("prompt_tokens_details").has("cached_tokens")) {
+                                        cachedTokens = u.get("prompt_tokens_details").get("cached_tokens").asInt();
+                                    }
+                                }
+                                if (jsonNode.has("choices") && jsonNode.get("choices").isArray() && jsonNode.get("choices").size() > 0) {
+                                    final JsonNode firstChoice = jsonNode.get("choices").get(0);
+                                    final boolean done = firstChoice.has("finish_reason") && !firstChoice.get("finish_reason").isNull();
+                                    if (done) {
+                                        lastFinishReason = firstChoice.get("finish_reason").asText();
+                                    }
+                                    final JsonNode delta = firstChoice.has("delta") ? firstChoice.get("delta") : null;
+                                    if (delta != null && delta.has("refusal") && !delta.get("refusal").isNull()) {
+                                        final String r = delta.get("refusal").asText();
+                                        lastRefusal = (lastRefusal == null) ? r : lastRefusal + r;
+                                    }
+                                    if (delta != null && delta.has("content") && !delta.get("content").isNull()) {
+                                        final String content = delta.get("content").asText();
+                                        callback.onChunk(content, done);
+                                        if (done) {
+                                            terminalCallbackSent = true;
+                                        }
+                                        if (chunkCount == 0) {
+                                            firstChunkTime = System.currentTimeMillis() - startTime;
+                                        }
+                                        chunkCount++;
+                                    } else if (done && !terminalCallbackSent) {
+                                        callback.onChunk("", true);
+                                        terminalCallbackSent = true;
+                                    }
+                                    // Continue reading even after done — usage chunk arrives next.
+                                }
+                                // Usage-only chunk has empty choices[]; size>0 guard above keeps callback silent.
+                            } catch (final JsonProcessingException e) {
+                                logger.warn("[LLM:OPENAI] Failed to parse streaming response. line={}", line, e);
+                            }
                         }
                     }
-                }
 
-                logger.info("[LLM:OPENAI] Stream completed. chunkCount={}, firstChunkMs={}, elapsedTime={}ms", chunkCount, firstChunkTime,
-                        System.currentTimeMillis() - startTime);
-            }
+                    final long elapsed = System.currentTimeMillis() - startTime;
+                    logger.info(
+                            "[LLM:OPENAI] Stream completed. chunkCount={}, objectCount={}, firstChunkMs={}, elapsedTime={}ms, "
+                                    + "id={}, systemFingerprint={}, finishReason={}, promptTokens={}, cachedTokens={}, "
+                                    + "completionTokens={}, reasoningTokens={}, totalTokens={}",
+                            chunkCount, objectCount, firstChunkTime, elapsed, lastResponseId, lastSystemFingerprint, lastFinishReason,
+                            promptTokens, cachedTokens, completionTokens, reasoningTokens, totalTokens);
+                    if (isAbnormalFinishReason(lastFinishReason)) {
+                        logger.warn(
+                                "[LLM:OPENAI] Stream finished abnormally. id={}, finishReason={}, chunkCount={}, "
+                                        + "completionTokens={}, reasoningTokens={}, model={}",
+                                lastResponseId, lastFinishReason, chunkCount, completionTokens, reasoningTokens, requestBody.get("model"));
+                    }
+                    if (lastRefusal != null) {
+                        logger.warn("[LLM:OPENAI] Stream refusal. id={}, refusal={}, model={}", lastResponseId, lastRefusal,
+                                requestBody.get("model"));
+                    }
+                    if (streamSummaryConsumer != null) {
+                        streamSummaryConsumer.accept(new StreamSummary(chunkCount, objectCount, lastFinishReason, lastResponseId,
+                                lastSystemFingerprint, promptTokens, cachedTokens, completionTokens, reasoningTokens, totalTokens,
+                                firstChunkTime, elapsed));
+                    }
+                    return null;
+                }
+            });
         } catch (final LlmException e) {
             callback.onError(e);
             throw e;
-        } catch (final IOException e) {
-            logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", url, e.getMessage(), e);
-            final LlmException llmException = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
-            callback.onError(llmException);
-            throw llmException;
+        } catch (final RetryableHttpException e) {
+            // Defensive: executeWithRetry consumes RetryableHttpException; this should never fire.
+            final LlmException llm = new LlmException("OpenAI API retryable exhausted", LlmException.ERROR_CONNECTION, e);
+            callback.onError(llm);
+            throw llm;
+        } catch (final IOException | ParseException | RuntimeException e) {
+            // RuntimeException covers consumer onChunk failures and unexpected JSON / runtime
+            // errors; the callback is always notified before propagating so onError stays symmetric with chat().
+            logger.warn("[LLM:OPENAI] Failed to stream from OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
+            final LlmException llm = new LlmException("Failed to stream from OpenAI API", LlmException.ERROR_CONNECTION, e);
+            callback.onError(llm);
+            throw llm;
         }
     }
 
@@ -317,6 +755,12 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         body.put("messages", messages);
 
         body.put("stream", stream);
+
+        if (stream && isStreamUsageEnabled()) {
+            final Map<String, Object> streamOptions = new HashMap<>();
+            streamOptions.put("include_usage", Boolean.TRUE);
+            body.put("stream_options", streamOptions);
+        }
 
         if (supportsTemperature(model) && request.getTemperature() != null) {
             body.put("temperature", request.getTemperature());
