@@ -232,7 +232,23 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * @param operation log label (e.g. {@code "chat"}).
      * @param call the HTTP call body.
      */
-    private <T> T executeWithRetry(final String operation, final HttpCall<T> call) throws IOException, ParseException {
+    <T> T executeWithRetry(final String operation, final HttpCall<T> call) throws IOException, ParseException {
+        return executeWithRetry(operation, call, null);
+    }
+
+    /**
+     * Same as {@link #executeWithRetry(String, HttpCall)} but additionally notifies the
+     * given {@link LlmStreamCallback} (when non-{@code null}) between attempts via
+     * {@link LlmStreamCallback#onRetry(String, int, int, long, Throwable)}.
+     *
+     * @param operation log label, e.g. {@code "chat"} or {@code "streamChat"}.
+     * @param call the HTTP call body.
+     * @param callback optional callback to notify on retry; may be {@code null}.
+     * @param <T> the call result type.
+     * @return the call result on success.
+     */
+    <T> T executeWithRetry(final String operation, final HttpCall<T> call, final LlmStreamCallback callback)
+            throws IOException, ParseException {
         final int maxAttempts = Math.max(1, getRetryMaxAttempts());
         final long baseDelay = Math.max(0L, getRetryBaseDelayMs());
         IOException lastIo = null;
@@ -250,21 +266,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                     throw new LlmException("OpenAI API retryable error: " + e.statusCode + " " + e.reason, resolveErrorCode(e.statusCode),
                             e);
                 }
-                final long delayMs;
-                if (e.retryAfterSeconds >= 0L) {
-                    delayMs = e.retryAfterSeconds * 1000L;
-                } else {
-                    final long jitter = (long) (baseDelay * 0.2 * ThreadLocalRandom.current().nextDouble(-1.0, 1.0));
-                    delayMs = (long) (baseDelay * Math.pow(2, attempt - 1)) + jitter;
-                }
-                logger.info("[LLM:OPENAI] {} retrying. attempt={}/{}, status={}, retryAfter={}s, sleepMs={}", operation, attempt,
-                        maxAttempts, e.statusCode, e.retryAfterSeconds, Math.max(0, delayMs));
-                try {
-                    Thread.sleep(Math.max(0, delayMs));
-                } catch (final InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Retry interrupted", ie);
-                }
+                sleepBackoff(operation, attempt, maxAttempts, baseDelay, e, callback);
             } catch (final IOException e) {
                 lastIo = e;
                 break;
@@ -277,6 +279,51 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             throw lastIo;
         }
         throw lastParse;
+    }
+
+    /**
+     * Sleeps the computed backoff interval and notifies the supplied callback before
+     * the actual sleep. When the {@link RetryableHttpException} carries a non-negative
+     * {@code Retry-After} hint (in seconds), it overrides the exponential-backoff +
+     * jitter computation. Restores interrupt status if interrupted. Exceptions thrown
+     * by the callback are swallowed (logged at DEBUG) so retry behavior is never
+     * affected by callback bugs.
+     *
+     * @param operation log label.
+     * @param attempt 1-based current attempt index.
+     * @param maxAttempts total attempts including the first.
+     * @param baseDelay base delay in milliseconds (already clamped to {@code >= 0}).
+     * @param cause the {@link RetryableHttpException} that triggered the retry.
+     * @param callback optional callback to notify; may be {@code null}.
+     * @throws IOException if the sleep is interrupted.
+     */
+    private void sleepBackoff(final String operation, final int attempt, final int maxAttempts, final long baseDelay,
+            final RetryableHttpException cause, final LlmStreamCallback callback) throws IOException {
+        final long delayMs;
+        if (cause.retryAfterSeconds >= 0L) {
+            delayMs = cause.retryAfterSeconds * 1000L;
+        } else {
+            final long jitter = (long) (baseDelay * 0.2 * ThreadLocalRandom.current().nextDouble(-1.0, 1.0));
+            delayMs = (long) (baseDelay * Math.pow(2, attempt - 1)) + jitter;
+        }
+        final long sleepMs = Math.max(0, delayMs);
+        logger.info("[LLM:OPENAI] {} retrying. attempt={}/{}, status={}, retryAfter={}s, sleepMs={}", operation, attempt, maxAttempts,
+                cause.statusCode, cause.retryAfterSeconds, sleepMs);
+        if (callback != null) {
+            try {
+                callback.onRetry(operation, attempt, maxAttempts, sleepMs, cause);
+            } catch (final Exception cbEx) {
+                if (logger.isDebugEnabled()) {
+                    logger.debug("[LLM:OPENAI] onRetry callback threw. error={}", cbEx.getMessage());
+                }
+            }
+        }
+        try {
+            Thread.sleep(sleepMs);
+        } catch (final InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Retry interrupted", ie);
+        }
     }
 
     private static final String ERROR_ENVELOPE_FIELD = "error";
@@ -716,7 +763,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                     }
                     return null;
                 }
-            });
+            }, callback);
         } catch (final LlmException e) {
             callback.onError(e);
             throw e;
