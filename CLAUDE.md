@@ -63,7 +63,17 @@ Enable `org.codelibs.fess.llm.openai` at DEBUG to additionally log:
 All URL log fields run through a credential-mask helper that strips
 `api_key`, `apikey`, `api-key`, `key`, `token`, `access_token`, `access-token`
 query parameters (case-insensitive) so URLs stored in `rag.llm.openai.api.url` for
-credentialed proxies do not leak keys to logs.
+credentialed proxies do not leak keys to logs. The helper also masks a URL's
+`user:password@` userinfo, but only defensively: HttpClient rejects a userinfo-bearing
+request URI outright, so such a URL can never issue a request.
+
+A malformed `api.url` is rejected while the request is built, and `URI.create` quotes the
+whole URI in the `IllegalArgumentException` it raises. Requests are therefore built through
+`HttpRequestFactory`, which replaces that exception with one naming only the configuration
+key plus the parser's reason and index, with no URL and no cause. Do not "improve" it by
+echoing a masked URL: a URL is unparseable precisely because it holds a character the
+masking patterns exclude, so the pattern that should have covered it is the one that stops
+matching.
 
 ### Auth & retries
 
@@ -104,11 +114,20 @@ older proxies, custom vLLM deployments) that reject this field.
 
 ### Reasoning models
 
-`max_completion_tokens` (in place of `max_tokens`), `reasoning_effort`, and the lack of
-support for custom `temperature` are all gated on a model-name prefix (`o1*`, `o3*`,
-`o4*`, `gpt-5*`). For these models the per-prompt-type default `max_tokens` is multiplied
-by `rag.llm.openai.reasoning.token.multiplier` (default `4`) so internal reasoning-token
-spend does not crowd out visible output.
+Reasoning models (`o1*`, `o3*`, `o4*`, `gpt-5*`) are the supported set; `gpt-5-nano` is
+what the plugin is exercised against. `isReasoningModel()` is the single predicate for the
+family - `useMaxCompletionTokens()` and `supportsTemperature()` delegate to it, so the three
+cannot drift apart. It gates `max_completion_tokens` (in place of `max_tokens`),
+`reasoning_effort`, and the suppression of `temperature`, `top_p`, `frequency_penalty` and
+`presence_penalty`, all four of which these models reject with
+`400 Unsupported parameter`. A suppressed parameter WARNs rather than being dropped
+silently, since it came from an explicit `rag.llm.openai.<promptType>.*` setting.
+
+For these models the per-prompt-type default `max_tokens` is multiplied by
+`rag.llm.openai.reasoning.token.multiplier` (default `4`) so internal reasoning-token spend
+does not crowd out visible output. Raising `reasoning.effort` on the short `intent` /
+`evaluation` prompts can still exhaust the budget on reasoning alone and return empty
+content - the `Chat finished abnormally ... contentLength=0` WARN is the signal.
 
 ## Testing
 

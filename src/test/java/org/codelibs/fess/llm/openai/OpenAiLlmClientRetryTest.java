@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.codelibs.fess.llm.LlmException;
 import org.codelibs.fess.llm.LlmStreamCallback;
+import org.codelibs.fess.openai.util.OpenAiRetry;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.junit.jupiter.api.Test;
 
@@ -71,7 +72,7 @@ public class OpenAiLlmClientRetryTest extends UnitFessTestCase {
         try {
             client.executeWithRetry("test", () -> {
                 attempts.incrementAndGet();
-                throw new OpenAiLlmClient.RetryableHttpException(500, "boom", -1L);
+                throw new OpenAiRetry.RetryableHttpException(500, "boom", -1L);
             }, cb);
             fail("expected LlmException after retries are exhausted");
         } catch (final LlmException expected) {
@@ -82,7 +83,7 @@ public class OpenAiLlmClientRetryTest extends UnitFessTestCase {
         assertEquals("onRetry fires between attempts (n-1 times)", 2, retryCount.get());
         assertEquals(List.of(1, 2), seenAttempts);
         for (final Throwable cause : seenCauses) {
-            assertTrue("cause should be RetryableHttpException, got: " + cause, cause instanceof OpenAiLlmClient.RetryableHttpException);
+            assertTrue("cause should be RetryableHttpException, got: " + cause, cause instanceof OpenAiRetry.RetryableHttpException);
         }
     }
 
@@ -108,7 +109,7 @@ public class OpenAiLlmClientRetryTest extends UnitFessTestCase {
         try {
             client.executeWithRetry("chat", () -> {
                 attempts.incrementAndGet();
-                throw new OpenAiLlmClient.RetryableHttpException(503, "unavailable", -1L);
+                throw new OpenAiRetry.RetryableHttpException(503, "unavailable", -1L);
             });
             fail("expected LlmException after retries are exhausted");
         } catch (final LlmException expected) {

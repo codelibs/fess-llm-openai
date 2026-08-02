@@ -171,4 +171,9 @@
 + "{{languageInstruction}}"
 		</property>
 	</component>
+	<component name="openaiEmbeddingClient" class="org.codelibs.fess.embedding.openai.OpenAiEmbeddingClient">
+		<postConstruct name="register"/>
+		<postConstruct name="init"/>
+		<preDestroy name="destroy"/>
+	</component>
 </components>
