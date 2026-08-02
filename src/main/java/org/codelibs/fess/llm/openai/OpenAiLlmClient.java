@@ -23,6 +23,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import org.apache.hc.client5.http.classic.methods.HttpGet;
@@ -40,7 +41,11 @@ import org.codelibs.fess.llm.LlmChatResponse;
 import org.codelibs.fess.llm.LlmException;
 import org.codelibs.fess.llm.LlmMessage;
 import org.codelibs.fess.llm.LlmStreamCallback;
+import org.codelibs.fess.openai.util.HttpRequestFactory;
+import org.codelibs.fess.openai.util.OpenAiErrorBody;
+import org.codelibs.fess.openai.util.OpenAiRetry;
 import org.codelibs.fess.util.ComponentUtil;
+import org.codelibs.fess.util.CredentialUrlUtil;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -95,64 +100,23 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     }
 
     /**
-     * Returns whether the given HTTP status code should be retried. Retryable: {@code 429}
-     * (rate limit), {@code 500} (server error), {@code 502} (bad gateway - OpenAI returns
-     * this under upstream overload), {@code 503} (service unavailable), {@code 504}
-     * (gateway timeout). All other statuses propagate immediately.
-     */
-    static boolean isRetryableStatus(final int statusCode) {
-        return statusCode == 429 || statusCode == 500 || statusCode == 502 || statusCode == 503 || statusCode == 504;
-    }
-
-    /** Maximum seconds we'll honor from a server-provided {@code Retry-After}. */
-    static final long RETRY_AFTER_CAP_SECONDS = 600L;
-
-    /**
-     * Parses an HTTP {@code Retry-After} header value as integer seconds. HTTP-date format
-     * is intentionally unsupported (returns {@code -1}) so the caller falls back to
-     * exponential backoff. Negative or non-numeric values also return {@code -1}.
-     * Values exceeding {@link #RETRY_AFTER_CAP_SECONDS} are clamped.
-     */
-    static long parseRetryAfterSeconds(final String value) {
-        if (value == null) {
-            return -1L;
-        }
-        final String trimmed = value.trim();
-        if (trimmed.isEmpty()) {
-            return -1L;
-        }
-        try {
-            final long seconds = Long.parseLong(trimmed);
-            if (seconds < 0) {
-                return -1L;
-            }
-            return Math.min(seconds, RETRY_AFTER_CAP_SECONDS);
-        } catch (final NumberFormatException e) {
-            return -1L;
-        }
-    }
-
-    /**
-     * Masks credential-bearing query parameters in a URL. Strips values for keys
-     * {@code api_key}, {@code apikey}, {@code api-key}, {@code key}, {@code token},
-     * {@code access_token} (case-insensitive), replacing each value with {@code ***}.
+     * Masks credentials in a URL before it is logged, covering both credential-bearing query
+     * parameters and the authority's userinfo component. See
+     * {@link CredentialUrlUtil#maskCredentialInUrl(String)} for the exact rules.
      *
      * <p>OpenAI uses header authentication - the canonical {@code https://api.openai.com}
-     * URL does not contain credentials - but {@code rag.llm.openai.api.url} may point at
-     * proxies (Azure, vLLM, custom gateways) that do, so all log lines that include a URL
-     * route through this helper.
+     * URL does not contain credentials - but {@code rag.llm.openai.api.url} may point at a
+     * gateway (Azure, vLLM, custom) that takes its credential as a query parameter, so all log
+     * lines that include a URL route through this helper. The userinfo rule is defensive only:
+     * HttpClient rejects a userinfo-bearing request URI outright, and this client now refuses such
+     * an {@code api.url} before any call site that masks a URL is reached, so no production path
+     * feeds userinfo to the masking rules at all.
      *
      * @param url the URL to mask (may be {@code null}).
      * @return the URL with credential values replaced by {@code ***}, or {@code null} when input is null.
      */
-    private static final java.util.regex.Pattern CREDENTIAL_QUERY_PARAM_PATTERN =
-            java.util.regex.Pattern.compile("(?i)([?&](?:api[-_]?key|key|token|access[-_]?token)=)[^&]*");
-
     static String maskCredentialInUrl(final String url) {
-        if (url == null) {
-            return null;
-        }
-        return CREDENTIAL_QUERY_PARAM_PATTERN.matcher(url).replaceAll("$1***");
+        return CredentialUrlUtil.maskCredentialInUrl(url);
     }
 
     /**
@@ -195,33 +159,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     }
 
     /**
-     * Internal signal thrown by the HTTP call body to indicate the received status code is
-     * retryable per {@link #isRetryableStatus(int)}. Caught by {@link #executeWithRetry};
-     * never escapes the client.
-     */
-    static final class RetryableHttpException extends RuntimeException {
-        private static final long serialVersionUID = 1L;
-        final int statusCode;
-        final String reason;
-        /** Seconds parsed from {@code Retry-After}, or {@code -1} when absent/unparseable. */
-        final long retryAfterSeconds;
-
-        RetryableHttpException(final int statusCode, final String reason, final long retryAfterSeconds) {
-            super("retryable http error: " + statusCode + " " + reason);
-            this.statusCode = statusCode;
-            this.reason = reason;
-            this.retryAfterSeconds = retryAfterSeconds;
-        }
-    }
-
-    /** Functional interface for the retryable HTTP call body executed by {@link #executeWithRetry}. */
-    @FunctionalInterface
-    interface HttpCall<T> {
-        T call() throws IOException, ParseException;
-    }
-
-    /**
-     * Executes {@code call} with retry on {@link RetryableHttpException}. {@link IOException},
+     * Executes {@code call} with retry on {@link OpenAiRetry.RetryableHttpException}. {@link IOException},
      * {@link ParseException}, and {@link LlmException} (RuntimeException, NOT caught here -
      * matches Gemini's contract: connect-failures and parse-failures are not retried because
      * we cannot tell whether the request reached the server or not) all propagate immediately.
@@ -232,7 +170,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * @param operation log label (e.g. {@code "chat"}).
      * @param call the HTTP call body.
      */
-    <T> T executeWithRetry(final String operation, final HttpCall<T> call) throws IOException, ParseException {
+    <T> T executeWithRetry(final String operation, final OpenAiRetry.HttpCall<T> call) throws IOException, ParseException {
         return executeWithRetry(operation, call, null);
     }
 
@@ -247,7 +185,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * @param <T> the call result type.
      * @return the call result on success.
      */
-    <T> T executeWithRetry(final String operation, final HttpCall<T> call, final LlmStreamCallback callback)
+    <T> T executeWithRetry(final String operation, final OpenAiRetry.HttpCall<T> call, final LlmStreamCallback callback)
             throws IOException, ParseException {
         final int maxAttempts = Math.max(1, getRetryMaxAttempts());
         final long baseDelay = Math.max(0L, getRetryBaseDelayMs());
@@ -256,7 +194,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
                 return call.call();
-            } catch (final RetryableHttpException e) {
+            } catch (final OpenAiRetry.RetryableHttpException e) {
                 if (attempt == maxAttempts) {
                     logger.warn("[LLM:OPENAI] {} retry exhausted. attempts={}, lastStatus={}, retryAfter={}s", operation, attempt,
                             e.statusCode, e.retryAfterSeconds);
@@ -283,7 +221,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
 
     /**
      * Sleeps the computed backoff interval and notifies the supplied callback before
-     * the actual sleep. When the {@link RetryableHttpException} carries a non-negative
+     * the actual sleep. When the {@link OpenAiRetry.RetryableHttpException} carries a non-negative
      * {@code Retry-After} hint (in seconds), it overrides the exponential-backoff +
      * jitter computation. Restores interrupt status if interrupted. Exceptions thrown
      * by the callback are swallowed (logged at DEBUG) so retry behavior is never
@@ -293,12 +231,12 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * @param attempt 1-based current attempt index.
      * @param maxAttempts total attempts including the first.
      * @param baseDelay base delay in milliseconds (already clamped to {@code >= 0}).
-     * @param cause the {@link RetryableHttpException} that triggered the retry.
+     * @param cause the {@link OpenAiRetry.RetryableHttpException} that triggered the retry.
      * @param callback optional callback to notify; may be {@code null}.
      * @throws IOException if the sleep is interrupted.
      */
     private void sleepBackoff(final String operation, final int attempt, final int maxAttempts, final long baseDelay,
-            final RetryableHttpException cause, final LlmStreamCallback callback) throws IOException {
+            final OpenAiRetry.RetryableHttpException cause, final LlmStreamCallback callback) throws IOException {
         final long delayMs;
         if (cause.retryAfterSeconds >= 0L) {
             delayMs = cause.retryAfterSeconds * 1000L;
@@ -326,44 +264,67 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         }
     }
 
-    private static final String ERROR_ENVELOPE_FIELD = "error";
-    private static final String ERROR_FIELD_TYPE = "type";
-    private static final String ERROR_FIELD_CODE = "code";
-    private static final String ERROR_FIELD_PARAM = "param";
-    private static final String ERROR_FIELD_MESSAGE = "message";
-
     /**
      * Renders an OpenAI error response body as a single-line diagnostic. Returns
      * {@code "type=...,code=...,param=...,message=..."} when the body parses as the
      * documented {@code {"error":{...}}} envelope; otherwise returns the body trimmed
-     * (clipped at 1024 chars + {@code "...(truncated)"} suffix) so non-JSON gateway
-     * pages remain readable in logs.
+     * so non-JSON gateway pages remain readable
+     * in logs. See {@link OpenAiErrorBody#render(String)} for the exact rendering rules.
      *
      * @param errorBody the raw HTTP response body from a failed OpenAI API call.
      * @return a single-line diagnostic suitable for logging.
      */
     protected String extractErrorDetails(final String errorBody) {
-        if (errorBody == null || errorBody.isEmpty()) {
-            return "";
-        }
-        try {
-            final JsonNode root = objectMapper.readTree(errorBody);
-            if (root.isObject() && root.has(ERROR_ENVELOPE_FIELD) && root.get(ERROR_ENVELOPE_FIELD).isObject()) {
-                final JsonNode err = root.get(ERROR_ENVELOPE_FIELD);
-                return String.format("%s=%s,%s=%s,%s=%s,%s=%s", ERROR_FIELD_TYPE, err.path(ERROR_FIELD_TYPE).asText("null"),
-                        ERROR_FIELD_CODE, err.path(ERROR_FIELD_CODE).asText("null"), ERROR_FIELD_PARAM,
-                        err.path(ERROR_FIELD_PARAM).asText("null"), ERROR_FIELD_MESSAGE, err.path(ERROR_FIELD_MESSAGE).asText("null"));
-            }
-        } catch (final JsonProcessingException e) {
-            // fall through to raw clip
-        }
-        final String trimmed = errorBody.trim();
-        return trimmed.length() > 1024 ? trimmed.substring(0, 1024) + "...(truncated)" : trimmed;
+        return OpenAiErrorBody.render(errorBody);
     }
 
     @Override
     public String getName() {
         return NAME;
+    }
+
+    /**
+     * Guards the one-shot ERROR emitted by {@link #isUserInfoApiUrlRefused(String)}. The
+     * availability check runs on a timer, so reporting the refusal on every pass would flood the
+     * log for as long as the misconfiguration lasts. Cleared again as soon as a check sees a URL
+     * without userinfo, so a re-broken configuration is reported afresh.
+     */
+    private final AtomicBoolean userInfoRefusalReported = new AtomicBoolean();
+
+    /**
+     * Returns whether the configured {@code api.url} must be refused because its authority carries
+     * a userinfo credential, reporting the reason and the remedy at ERROR the first time.
+     *
+     * <p>This <em>fails closed</em> - it reports the client unavailable rather than throwing.
+     * {@link #checkAvailabilityNow()} is reached from {@code init()}, which the DI container runs
+     * as a {@code postConstruct} init method during eager assembly
+     * ({@code init} -&gt; {@code startAvailabilityCheck} -&gt; {@code updateAvailability} -&gt;
+     * {@code checkAvailabilityNow}); an exception escaping there would abort container startup, so
+     * a bad configuration value would stop the whole application from starting rather than
+     * disabling one optional client. The request paths ({@link #chat} / {@link #streamChat}) are
+     * never reached during initialization and do throw, because they have no other way to report
+     * failure.
+     *
+     * <p>Nothing about the URL is logged: the URL is what holds the credential, and the userinfo
+     * masking rule does not cover a credential containing whitespace.
+     *
+     * @param apiUrl the configured API URL.
+     * @return true when the URL carries userinfo and no request may be attempted.
+     */
+    private boolean isUserInfoApiUrlRefused(final String apiUrl) {
+        if (!CredentialUrlUtil.hasUserInfo(apiUrl)) {
+            userInfoRefusalReported.set(false);
+            return false;
+        }
+        if (userInfoRefusalReported.compareAndSet(false, true)) {
+            logger.error("[LLM:OPENAI] OpenAI is not available. {}", HttpRequestFactory.userInfoRejectedMessage(userInfoConfigKey()));
+        }
+        return true;
+    }
+
+    /** The configuration key named by a userinfo refusal. */
+    private String userInfoConfigKey() {
+        return getConfigPrefix() + ".api.url";
     }
 
     @Override
@@ -382,9 +343,12 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             }
             return false;
         }
+        if (isUserInfoApiUrlRefused(apiUrl)) {
+            return false;
+        }
         final String maskedUrl = maskCredentialInUrl(apiUrl);
         try {
-            final HttpGet request = new HttpGet(apiUrl + "/models");
+            final HttpGet request = HttpRequestFactory.createGet(apiUrl + "/models", userInfoConfigKey());
             request.addHeader("Authorization", "Bearer " + apiKey);
             try (var response = getHttpClient().execute(request)) {
                 final int statusCode = response.getCode();
@@ -405,7 +369,14 @@ public class OpenAiLlmClient extends AbstractLlmClient {
 
     @Override
     public LlmChatResponse chat(final LlmChatRequest request) {
-        final String url = getApiUrl() + "/chat/completions";
+        final String apiUrl = getApiUrl();
+        if (CredentialUrlUtil.hasUserInfo(apiUrl)) {
+            // Refused before the masked URL is computed, let alone logged: the masking rules do
+            // not cover a userinfo credential containing whitespace, so the url={} field of the
+            // failure log would otherwise hand that credential back verbatim.
+            throw new LlmException(HttpRequestFactory.userInfoRejectedMessage(userInfoConfigKey()), LlmException.ERROR_CONNECTION);
+        }
+        final String url = apiUrl + "/chat/completions";
         final String maskedUrl = maskCredentialInUrl(url);
         final Map<String, Object> requestBody = buildRequestBody(request, false);
         final long startTime = System.currentTimeMillis();
@@ -420,7 +391,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             if (logger.isDebugEnabled()) {
                 logger.debug("[LLM:OPENAI] requestBody={}", json);
             }
-            final HttpPost httpRequest = new HttpPost(url);
+            final HttpPost httpRequest = HttpRequestFactory.createPost(url, userInfoConfigKey());
             httpRequest.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON)); // repeatable per HttpClient 5 contract
             httpRequest.addHeader("Authorization", "Bearer " + getApiKey());
 
@@ -437,10 +408,10 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                         final String errorDetails = extractErrorDetails(errorBody);
                         logger.warn("[LLM:OPENAI] API error. url={}, statusCode={}, message={}, error={}", maskedUrl, statusCode,
                                 response.getReasonPhrase(), errorDetails);
-                        if (isRetryableStatus(statusCode)) {
+                        if (OpenAiRetry.isRetryableStatus(statusCode)) {
                             final var ra = response.getFirstHeader("Retry-After");
-                            final long retryAfter = parseRetryAfterSeconds(ra != null ? ra.getValue() : null);
-                            throw new RetryableHttpException(statusCode, response.getReasonPhrase(), retryAfter);
+                            final long retryAfter = OpenAiRetry.parseRetryAfterSeconds(ra != null ? ra.getValue() : null);
+                            throw new OpenAiRetry.RetryableHttpException(statusCode, response.getReasonPhrase(), retryAfter);
                         }
                         throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
                                 resolveErrorCode(statusCode));
@@ -520,8 +491,8 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             });
         } catch (final LlmException e) {
             throw e;
-        } catch (final RetryableHttpException e) {
-            // Defensive: executeWithRetry consumes RetryableHttpException; this should never fire.
+        } catch (final OpenAiRetry.RetryableHttpException e) {
+            // Defensive: executeWithRetry consumes OpenAiRetry.RetryableHttpException; this should never fire.
             throw new LlmException("OpenAI API retryable exhausted", LlmException.ERROR_CONNECTION, e);
         } catch (final Exception e) {
             logger.warn("[LLM:OPENAI] Failed to call OpenAI API. url={}, error={}", maskedUrl, e.getMessage(), e);
@@ -586,7 +557,16 @@ public class OpenAiLlmClient extends AbstractLlmClient {
 
     @Override
     public void streamChat(final LlmChatRequest request, final LlmStreamCallback callback) {
-        final String url = getApiUrl() + "/chat/completions";
+        final String apiUrl = getApiUrl();
+        if (CredentialUrlUtil.hasUserInfo(apiUrl)) {
+            // Refused before the masked URL is computed, let alone logged - see chat(). The
+            // callback is notified first so onError stays symmetric with every other failure.
+            final LlmException e =
+                    new LlmException(HttpRequestFactory.userInfoRejectedMessage(userInfoConfigKey()), LlmException.ERROR_CONNECTION);
+            callback.onError(e);
+            throw e;
+        }
+        final String url = apiUrl + "/chat/completions";
         final String maskedUrl = maskCredentialInUrl(url);
         final Map<String, Object> requestBody = buildRequestBody(request, true);
         final long startTime = System.currentTimeMillis();
@@ -601,7 +581,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             if (logger.isDebugEnabled()) {
                 logger.debug("[LLM:OPENAI] requestBody={}", json);
             }
-            final HttpPost httpRequest = new HttpPost(url);
+            final HttpPost httpRequest = HttpRequestFactory.createPost(url, userInfoConfigKey());
             httpRequest.setEntity(new StringEntity(json, ContentType.APPLICATION_JSON));
             httpRequest.addHeader("Authorization", "Bearer " + getApiKey());
 
@@ -623,10 +603,10 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                         final String errorDetails = extractErrorDetails(errorBody);
                         logger.warn("[LLM:OPENAI] Streaming API error. url={}, statusCode={}, message={}, error={}", maskedUrl, statusCode,
                                 response.getReasonPhrase(), errorDetails);
-                        if (isRetryableStatus(statusCode)) {
+                        if (OpenAiRetry.isRetryableStatus(statusCode)) {
                             final var ra = response.getFirstHeader("Retry-After");
-                            final long retryAfter = parseRetryAfterSeconds(ra != null ? ra.getValue() : null);
-                            throw new RetryableHttpException(statusCode, response.getReasonPhrase(), retryAfter);
+                            final long retryAfter = OpenAiRetry.parseRetryAfterSeconds(ra != null ? ra.getValue() : null);
+                            throw new OpenAiRetry.RetryableHttpException(statusCode, response.getReasonPhrase(), retryAfter);
                         }
                         throw new LlmException("OpenAI API error: " + statusCode + " " + response.getReasonPhrase(),
                                 resolveErrorCode(statusCode));
@@ -767,8 +747,8 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         } catch (final LlmException e) {
             callback.onError(e);
             throw e;
-        } catch (final RetryableHttpException e) {
-            // Defensive: executeWithRetry consumes RetryableHttpException; this should never fire.
+        } catch (final OpenAiRetry.RetryableHttpException e) {
+            // Defensive: executeWithRetry consumes OpenAiRetry.RetryableHttpException; this should never fire.
             final LlmException llm = new LlmException("OpenAI API retryable exhausted", LlmException.ERROR_CONNECTION, e);
             callback.onError(llm);
             throw llm;
@@ -825,34 +805,60 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             }
         }
 
-        final String topP = request.getExtraParam("top_p");
-        if (topP != null) {
-            try {
-                body.put("top_p", Double.parseDouble(topP));
-            } catch (final NumberFormatException e) {
-                logger.warn("[LLM:OPENAI] Invalid top_p value: {}", topP);
-            }
-        }
-
-        final String frequencyPenalty = request.getExtraParam("frequency_penalty");
-        if (frequencyPenalty != null) {
-            try {
-                body.put("frequency_penalty", Double.parseDouble(frequencyPenalty));
-            } catch (final NumberFormatException e) {
-                logger.warn("[LLM:OPENAI] Invalid frequency_penalty value: {}", frequencyPenalty);
-            }
-        }
-
-        final String presencePenalty = request.getExtraParam("presence_penalty");
-        if (presencePenalty != null) {
-            try {
-                body.put("presence_penalty", Double.parseDouble(presencePenalty));
-            } catch (final NumberFormatException e) {
-                logger.warn("[LLM:OPENAI] Invalid presence_penalty value: {}", presencePenalty);
-            }
-        }
+        // Reasoning models reject these outright (HTTP 400 "Unsupported parameter"), exactly as
+        // they reject a non-default temperature. Sending them would fail the whole chat rather
+        // than degrade it, so they are dropped with a warning naming the model.
+        final boolean sampling = supportsSamplingParams(model);
+        putDoubleParam(body, request, "top_p", sampling, model);
+        putDoubleParam(body, request, "frequency_penalty", sampling, model);
+        putDoubleParam(body, request, "presence_penalty", sampling, model);
 
         return body;
+    }
+
+    /**
+     * Copies a numeric extra param into the request body, unless the model does not accept it.
+     *
+     * @param body the request body being built.
+     * @param request the chat request carrying the configured extra params.
+     * @param name the OpenAI request-body field name, which is also the extra-param key.
+     * @param supported whether this model accepts the parameter at all.
+     * @param model the model name, for the log line when the parameter is dropped.
+     */
+    protected void putDoubleParam(final Map<String, Object> body, final LlmChatRequest request, final String name, final boolean supported,
+            final String model) {
+        final String value = request.getExtraParam(name);
+        if (value == null) {
+            return;
+        }
+        if (!supported) {
+            // Warn rather than drop silently: the value came from an explicit
+            // rag.llm.openai.<promptType>.<name> setting, and silence would read as "ignored".
+            logger.warn("[LLM:OPENAI] {} is not supported by model {} and was not sent. Remove the "
+                    + "rag.llm.openai.*.{} setting for this model.", name, model, name);
+            return;
+        }
+        try {
+            body.put(name, Double.parseDouble(value));
+        } catch (final NumberFormatException e) {
+            logger.warn("[LLM:OPENAI] Invalid {} value: {}", name, value);
+        }
+    }
+
+    /**
+     * Determines whether the given model accepts the sampling parameters {@code top_p},
+     * {@code frequency_penalty} and {@code presence_penalty}.
+     *
+     * <p>Reasoning models accept none of them - verified against the live API, which answers
+     * {@code 400 Unsupported parameter: 'top_p' is not supported with this model.} and the
+     * equivalent for both penalties. This mirrors {@link #supportsTemperature(String)}, which
+     * already guards the fourth member of the same group.
+     *
+     * @param model the model name.
+     * @return true if the model supports the sampling parameters.
+     */
+    protected boolean supportsSamplingParams(final String model) {
+        return !isReasoningModel(model);
     }
 
     /**
@@ -863,16 +869,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * @return true if the model uses max_completion_tokens
      */
     protected boolean useMaxCompletionTokens(final String model) {
-        if (StringUtil.isBlank(model)) {
-            return false;
-        }
-        if (model.startsWith("o1") || model.startsWith("o3") || model.startsWith("o4")) {
-            return true;
-        }
-        if (model.startsWith("gpt-5")) {
-            return true;
-        }
-        return false;
+        return isReasoningModel(model);
     }
 
     /**
@@ -884,16 +881,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * @return true if the model supports custom temperature values
      */
     protected boolean supportsTemperature(final String model) {
-        if (StringUtil.isBlank(model)) {
-            return true;
-        }
-        if (model.startsWith("o1") || model.startsWith("o3") || model.startsWith("o4")) {
-            return false;
-        }
-        if (model.startsWith("gpt-5")) {
-            return false;
-        }
-        return true;
+        return !isReasoningModel(model);
     }
 
     /**

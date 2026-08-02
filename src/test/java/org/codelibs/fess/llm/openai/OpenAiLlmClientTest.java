@@ -16,6 +16,8 @@
 package org.codelibs.fess.llm.openai;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -33,6 +35,7 @@ import org.codelibs.fess.llm.LlmChatResponse;
 import org.codelibs.fess.llm.LlmException;
 import org.codelibs.fess.llm.LlmMessage;
 import org.codelibs.fess.llm.LlmStreamCallback;
+import org.codelibs.fess.openai.util.OpenAiRetry;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
@@ -198,6 +201,70 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         final Map<String, Object> body = client.buildRequestBody(request, false);
 
         assertEquals(0.5, body.get("temperature"));
+    }
+
+    @Test
+    public void test_buildRequestBody_reasoningModelOmitsSamplingParams() {
+        // Verified against the live API: gpt-5 answers 400 "Unsupported parameter: 'top_p' is
+        // not supported with this model." and the same for both penalties -- the identical
+        // treatment temperature already gets. Sending them fails the whole chat rather than
+        // degrading it, so a configured rag.llm.openai.<promptType>.top.p must be dropped.
+        client.setTestModel("gpt-5-nano");
+        client.setTestTemperature(0.7);
+        client.setTestMaxTokens(4096);
+
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        request.putExtraParam("top_p", "0.9");
+        request.putExtraParam("frequency_penalty", "0.5");
+        request.putExtraParam("presence_penalty", "0.5");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+
+        assertNull(body.get("top_p"), "top_p must not be sent to a reasoning model");
+        assertNull(body.get("frequency_penalty"), "frequency_penalty must not be sent to a reasoning model");
+        assertNull(body.get("presence_penalty"), "presence_penalty must not be sent to a reasoning model");
+    }
+
+    @Test
+    public void test_buildRequestBody_nonReasoningModelKeepsSamplingParams() {
+        // The fallback path for unrecognized names (Azure deployments, OpenAI-compatible
+        // gateways) must keep accepting these, so the suppression is gated on the model family
+        // and not applied unconditionally.
+        client.setTestModel("my-azure-deployment");
+        client.setTestTemperature(0.7);
+        client.setTestMaxTokens(4096);
+
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        request.putExtraParam("top_p", "0.9");
+        request.putExtraParam("frequency_penalty", "0.25");
+        request.putExtraParam("presence_penalty", "0.125");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+
+        assertEquals(0.9, body.get("top_p"));
+        assertEquals(0.25, body.get("frequency_penalty"));
+        assertEquals(0.125, body.get("presence_penalty"));
+    }
+
+    @Test
+    public void test_modelFamilyPredicatesAgree() {
+        // useMaxCompletionTokens and supportsTemperature delegate to isReasoningModel so the
+        // three cannot drift apart. This also pins the blank-model defaults, which differ:
+        // a blank name is treated as non-reasoning, hence max_tokens and temperature allowed.
+        for (final String model : new String[] { "gpt-5", "gpt-5-nano", "o1-preview", "o3-mini", "o4-mini" }) {
+            assertTrue(model + " must be a reasoning model", client.isReasoningModel(model));
+            assertTrue(model + " must use max_completion_tokens", client.useMaxCompletionTokens(model));
+            assertFalse(model + " must not accept temperature", client.supportsTemperature(model));
+            assertFalse(model + " must not accept sampling params", client.supportsSamplingParams(model));
+        }
+        // gpt-4o and friends are outside the tested set but must stay usable when configured,
+        // so the classic parameter set is pinned for them alongside unknown names.
+        for (final String model : new String[] { "gpt-4o", "gpt-4o-mini", "gpt-4", "gpt-3.5-turbo", "my-azure-deployment", "" }) {
+            assertFalse("'" + model + "' must not be a reasoning model", client.isReasoningModel(model));
+            assertFalse("'" + model + "' must use max_tokens", client.useMaxCompletionTokens(model));
+            assertTrue("'" + model + "' must accept temperature", client.supportsTemperature(model));
+            assertTrue("'" + model + "' must accept sampling params", client.supportsSamplingParams(model));
+        }
     }
 
     @Test
@@ -2647,6 +2714,10 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_buildRequestBody_withAllExtraParams() {
+        // gpt-5-mini is a reasoning model, so only reasoning_effort survives here. This test
+        // previously asserted that all four extra params were sent, which is what the live API
+        // rejects with 400 "Unsupported parameter" - it was green against a body the server
+        // would refuse. The sampling params are covered on a non-reasoning model below.
         client.setTestModel("gpt-5-mini");
         client.setTestTemperature(0.7);
         client.setTestMaxTokens(4096);
@@ -2660,6 +2731,28 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         final Map<String, Object> body = client.buildRequestBody(request, false);
 
         assertEquals("low", body.get("reasoning_effort"));
+        assertNull(body.get("top_p"), "top_p is unsupported by reasoning models");
+        assertNull(body.get("frequency_penalty"), "frequency_penalty is unsupported by reasoning models");
+        assertNull(body.get("presence_penalty"), "presence_penalty is unsupported by reasoning models");
+    }
+
+    @Test
+    public void test_buildRequestBody_withAllExtraParamsOnNonReasoningModel() {
+        // The counterpart of the above: on a name outside the reasoning families the sampling
+        // params are still forwarded, and reasoning_effort is the one that drops out.
+        client.setTestModel("my-gateway-deployment");
+        client.setTestTemperature(0.7);
+        client.setTestMaxTokens(4096);
+
+        final LlmChatRequest request = new LlmChatRequest().putExtraParam("reasoning_effort", "low")
+                .putExtraParam("top_p", "0.95")
+                .putExtraParam("frequency_penalty", "0.2")
+                .putExtraParam("presence_penalty", "0.1")
+                .addUserMessage("Hello");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+
+        assertNull(body.get("reasoning_effort"), "reasoning_effort is only sent to reasoning models");
         assertEquals(0.95, body.get("top_p"));
         assertEquals(0.2, body.get("frequency_penalty"));
         assertEquals(0.1, body.get("presence_penalty"));
@@ -2745,102 +2838,102 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
     @Test
     public void test_isRetryableStatus_429() {
-        assertTrue(OpenAiLlmClient.isRetryableStatus(429));
+        assertTrue(OpenAiRetry.isRetryableStatus(429));
     }
 
     @Test
     public void test_isRetryableStatus_500() {
-        assertTrue(OpenAiLlmClient.isRetryableStatus(500));
+        assertTrue(OpenAiRetry.isRetryableStatus(500));
     }
 
     @Test
     public void test_isRetryableStatus_502() {
-        assertTrue(OpenAiLlmClient.isRetryableStatus(502));
+        assertTrue(OpenAiRetry.isRetryableStatus(502));
     }
 
     @Test
     public void test_isRetryableStatus_503() {
-        assertTrue(OpenAiLlmClient.isRetryableStatus(503));
+        assertTrue(OpenAiRetry.isRetryableStatus(503));
     }
 
     @Test
     public void test_isRetryableStatus_504() {
-        assertTrue(OpenAiLlmClient.isRetryableStatus(504));
+        assertTrue(OpenAiRetry.isRetryableStatus(504));
     }
 
     @Test
     public void test_isRetryableStatus_400() {
-        assertFalse(OpenAiLlmClient.isRetryableStatus(400));
+        assertFalse(OpenAiRetry.isRetryableStatus(400));
     }
 
     @Test
     public void test_isRetryableStatus_401() {
-        assertFalse(OpenAiLlmClient.isRetryableStatus(401));
+        assertFalse(OpenAiRetry.isRetryableStatus(401));
     }
 
     @Test
     public void test_isRetryableStatus_404() {
-        assertFalse(OpenAiLlmClient.isRetryableStatus(404));
+        assertFalse(OpenAiRetry.isRetryableStatus(404));
     }
 
     @Test
     public void test_isRetryableStatus_408_notRetried() {
         // OpenAI rarely returns 408; if it ever appears in production logs we'll add it.
-        assertFalse(OpenAiLlmClient.isRetryableStatus(408));
+        assertFalse(OpenAiRetry.isRetryableStatus(408));
     }
 
     @Test
     public void test_isRetryableStatus_200() {
-        assertFalse(OpenAiLlmClient.isRetryableStatus(200));
+        assertFalse(OpenAiRetry.isRetryableStatus(200));
     }
 
     // ========== parseRetryAfterSeconds tests ==========
 
     @Test
     public void test_parseRetryAfterSeconds_integer() {
-        assertEquals(5L, OpenAiLlmClient.parseRetryAfterSeconds("5"));
+        assertEquals(5L, OpenAiRetry.parseRetryAfterSeconds("5"));
     }
 
     @Test
     public void test_parseRetryAfterSeconds_zero() {
-        assertEquals(0L, OpenAiLlmClient.parseRetryAfterSeconds("0"));
+        assertEquals(0L, OpenAiRetry.parseRetryAfterSeconds("0"));
     }
 
     @Test
     public void test_parseRetryAfterSeconds_largeClamped() {
-        assertEquals(600L, OpenAiLlmClient.parseRetryAfterSeconds("3600"));
+        assertEquals(600L, OpenAiRetry.parseRetryAfterSeconds("3600"));
     }
 
     @Test
     public void test_parseRetryAfterSeconds_negative() {
-        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds("-1"));
+        assertEquals(-1L, OpenAiRetry.parseRetryAfterSeconds("-1"));
     }
 
     @Test
     public void test_parseRetryAfterSeconds_null() {
-        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds(null));
+        assertEquals(-1L, OpenAiRetry.parseRetryAfterSeconds(null));
     }
 
     @Test
     public void test_parseRetryAfterSeconds_blank() {
-        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds(""));
-        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds("  "));
+        assertEquals(-1L, OpenAiRetry.parseRetryAfterSeconds(""));
+        assertEquals(-1L, OpenAiRetry.parseRetryAfterSeconds("  "));
     }
 
     @Test
     public void test_parseRetryAfterSeconds_httpDate() {
         // HTTP-date format intentionally unsupported; caller falls back to backoff.
-        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds("Wed, 21 Oct 2026 07:28:00 GMT"));
+        assertEquals(-1L, OpenAiRetry.parseRetryAfterSeconds("Wed, 21 Oct 2026 07:28:00 GMT"));
     }
 
     @Test
     public void test_parseRetryAfterSeconds_decimal() {
-        assertEquals(-1L, OpenAiLlmClient.parseRetryAfterSeconds("1.5"));
+        assertEquals(-1L, OpenAiRetry.parseRetryAfterSeconds("1.5"));
     }
 
     @Test
     public void test_parseRetryAfterSeconds_whitespacePadded() {
-        assertEquals(7L, OpenAiLlmClient.parseRetryAfterSeconds("  7  "));
+        assertEquals(7L, OpenAiRetry.parseRetryAfterSeconds("  7  "));
     }
 
     // ========== maskCredentialInUrl tests ==========
@@ -2891,6 +2984,310 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertFalse("access_token value must not leak: " + masked, masked.contains("secret2"));
         assertFalse("token value must not leak: " + masked, masked.contains("secret3"));
         assertTrue("non-credential param must be preserved: " + masked, masked.contains("model=gpt"));
+    }
+
+    @Test
+    public void test_maskCredentialInUrl_masksUserInfo() {
+        // Defensive rule: HttpClient rejects a userinfo-bearing request URI outright, so such a
+        // URL can never issue a request. The rule only keeps a mistyped credential in that
+        // position out of the log, since the query-parameter pattern never matches it.
+        assertEquals("https://***:***@gw.example.com/v1", OpenAiLlmClient.maskCredentialInUrl("https://user:pass@gw.example.com/v1"));
+        assertEquals("http://***:***@gw.example.com/v1/chat/completions",
+                OpenAiLlmClient.maskCredentialInUrl("http://user:pass@gw.example.com/v1/chat/completions"));
+        // Both rules must apply to the same URL.
+        assertEquals("https://***:***@gw.example.com/v1?api-key=***",
+                OpenAiLlmClient.maskCredentialInUrl("https://user:pass@gw.example.com/v1?api-key=secret"));
+    }
+
+    @Test
+    public void test_maskCredentialInUrl_cleanUrlUnchanged() {
+        // No credentials anywhere: the URL must survive byte-for-byte. In particular the userinfo
+        // rule must not fire on a port-bearing authority ("host:8443") or on a path colon.
+        assertEquals("https://gw.example.com:8443/v1", OpenAiLlmClient.maskCredentialInUrl("https://gw.example.com:8443/v1"));
+        assertEquals("https://gw.example.com:8443/v1/chat/completions",
+                OpenAiLlmClient.maskCredentialInUrl("https://gw.example.com:8443/v1/chat/completions"));
+        assertEquals("https://h/v1/chat/completions?api-version=2024-02-01",
+                OpenAiLlmClient.maskCredentialInUrl("https://h/v1/chat/completions?api-version=2024-02-01"));
+    }
+
+    // ========== malformed api.url must not leak the credential ==========
+
+    /**
+     * A configured {@code api.url} that carries a credential as a query parameter - the only
+     * credential-in-URL form a working configuration can genuinely use - and whose value contains
+     * a character that is illegal in a URI (here a space). {@code URI.create} rejects it and
+     * quotes the whole URI in the {@link IllegalArgumentException} it raises.
+     */
+    private static final String MALFORMED_CREDENTIAL_URL = "https://gw.example.com/v1?api_key=sk secret";
+
+    /** The credential value that must appear nowhere in a log line or in a propagated exception. */
+    private static final String RAW_CREDENTIAL = "sk secret";
+
+    /** Renders a throwable the way a log layout would: every message plus every frame of the cause chain. */
+    private static String renderThrowable(final Throwable t) {
+        final StringWriter sw = new StringWriter();
+        t.printStackTrace(new PrintWriter(sw));
+        return sw.toString();
+    }
+
+    @Test
+    public void test_chat_malformedApiUrlDoesNotLeakCredential() {
+        client.setTestApiUrl(MALFORMED_CREDENTIAL_URL);
+        client.setTestApiKey("sk-test-key");
+        client.init();
+        final ListAppender app = attachLogCapture();
+        try {
+            client.chat(new LlmChatRequest().addUserMessage("Hello"));
+            fail("expected LlmException for a malformed api.url");
+        } catch (final LlmException e) {
+            final String propagated = renderThrowable(e);
+            assertFalse("propagated exception must not carry the credential: " + propagated, propagated.contains(RAW_CREDENTIAL));
+        } finally {
+            final String logged = app.rendered();
+            detachLogCapture(app);
+            assertFalse("log must not carry the credential: " + logged, logged.contains(RAW_CREDENTIAL));
+            assertTrue("log must still identify the endpoint in masked form: " + logged, logged.contains("api_key=***"));
+        }
+    }
+
+    @Test
+    public void test_streamChat_malformedApiUrlDoesNotLeakCredential() {
+        client.setTestApiUrl(MALFORMED_CREDENTIAL_URL);
+        client.setTestApiKey("sk-test-key");
+        client.init();
+        final List<Throwable> callbackErrors = new ArrayList<>();
+        final ListAppender app = attachLogCapture();
+        try {
+            client.streamChat(new LlmChatRequest().addUserMessage("Hello"), new LlmStreamCallback() {
+                @Override
+                public void onChunk(final String chunk, final boolean done) {
+                    // not reached
+                }
+
+                @Override
+                public void onError(final Throwable t) {
+                    callbackErrors.add(t);
+                }
+            });
+            fail("expected LlmException for a malformed api.url");
+        } catch (final LlmException e) {
+            final String propagated = renderThrowable(e);
+            assertFalse("propagated exception must not carry the credential: " + propagated, propagated.contains(RAW_CREDENTIAL));
+        } finally {
+            final String logged = app.rendered();
+            detachLogCapture(app);
+            assertFalse("log must not carry the credential: " + logged, logged.contains(RAW_CREDENTIAL));
+        }
+        assertEquals(1, callbackErrors.size());
+        final String viaCallback = renderThrowable(callbackErrors.get(0));
+        assertFalse("callback error must not carry the credential: " + viaCallback, viaCallback.contains(RAW_CREDENTIAL));
+    }
+
+    @Test
+    public void test_isAvailable_malformedApiUrlDoesNotLeakCredential() {
+        client.setTestApiUrl(MALFORMED_CREDENTIAL_URL);
+        client.setTestApiKey("sk-test-key");
+        client.init();
+        final ListAppender app = attachLogCapture();
+        try {
+            assertFalse(client.isAvailable());
+        } finally {
+            final String logged = app.rendered();
+            detachLogCapture(app);
+            assertFalse("log must not carry the credential: " + logged, logged.contains(RAW_CREDENTIAL));
+        }
+    }
+
+    /**
+     * A credential sitting in the URL's userinfo and containing a space. The userinfo masking
+     * rule excludes whitespace, so it cannot match this URL - masking it is a no-op. Any
+     * exception that echoes the URL, masked or not, therefore hands the credential straight back,
+     * which is why the replacement exception must carry no URL at all.
+     */
+    private static final String MALFORMED_USERINFO_URL = "https://user:pw spaced@gw.example.com/v1";
+
+    /** The userinfo credential that must appear in no exception the request-building path produces. */
+    private static final String RAW_USERINFO_CREDENTIAL = "pw spaced";
+
+    @Test
+    public void test_streamChat_malformedUserInfoNotEchoedByException() {
+        client.setTestApiUrl(MALFORMED_USERINFO_URL);
+        client.setTestApiKey("sk-test-key");
+        client.init();
+        final List<Throwable> callbackErrors = new ArrayList<>();
+        final ListAppender app = attachLogCapture();
+        try {
+            client.streamChat(new LlmChatRequest().addUserMessage("Hello"), new LlmStreamCallback() {
+                @Override
+                public void onChunk(final String chunk, final boolean done) {
+                    // not reached
+                }
+
+                @Override
+                public void onError(final Throwable t) {
+                    callbackErrors.add(t);
+                }
+            });
+            fail("expected LlmException for a malformed api.url");
+        } catch (final LlmException e) {
+            final String propagated = renderThrowable(e);
+            assertFalse("propagated cause chain must not carry the credential: " + propagated,
+                    propagated.contains(RAW_USERINFO_CREDENTIAL));
+        } finally {
+            final String thrown = app.renderedThrowables();
+            detachLogCapture(app);
+            assertFalse("logged throwable must not carry the credential: " + thrown, thrown.contains(RAW_USERINFO_CREDENTIAL));
+        }
+        assertEquals(1, callbackErrors.size());
+        final String viaCallback = renderThrowable(callbackErrors.get(0));
+        assertFalse("callback error must not carry the credential: " + viaCallback, viaCallback.contains(RAW_USERINFO_CREDENTIAL));
+    }
+
+    // ========== userinfo-bearing api.url is refused before any request ==========
+
+    /**
+     * A {@code rag.llm.openai.api.url} carrying a userinfo credential. RFC 9110 forbids userinfo
+     * in an http/https target URI and HttpClient enforces that unconditionally, so this value can
+     * never issue a request; OpenAI-compatible gateways authenticate with {@code Authorization:
+     * Bearer}, and an endpoint behind an authenticating proxy is configured through
+     * {@code http.proxy.*}. It is therefore an operator error with a supported alternative, and the
+     * client must say so instead of failing opaquely at request time.
+     */
+    private static final String USERINFO_API_URL = "https://user:s3cr3tUserinfo@gw.example.com/v1";
+
+    /** The userinfo credential that must appear in no message, throwable, cause or callback error. */
+    private static final String USERINFO_CREDENTIAL = "s3cr3tUserinfo";
+
+    /** The supported alternative the refusal must name. */
+    private static final String PROXY_USERNAME_KEY = "http.proxy.username";
+
+    /** The supported alternative the refusal must name. */
+    private static final String PROXY_PASSWORD_KEY = "http.proxy.password";
+
+    @Test
+    public void test_isAvailable_userInfoApiUrlReportsUnavailableWithRemedy() {
+        client.setTestApiUrl(USERINFO_API_URL);
+        client.setTestApiKey("sk-test-key");
+        final ListAppender app = attachLogCapture();
+        try {
+            assertFalse("a userinfo-bearing api.url can never issue a request", client.isAvailable());
+            final List<String> errors = app.messagesAt(org.apache.logging.log4j.Level.ERROR);
+            assertEquals("the refusal must be reported at ERROR: " + app.messages(), 1, errors.size());
+            final String error = errors.get(0);
+            assertTrue("the offending configuration key must be named: " + error, error.contains("rag.llm.openai.api.url"));
+            assertTrue("the supported alternative must be named: " + error, error.contains(PROXY_USERNAME_KEY));
+            assertTrue("the supported alternative must be named: " + error, error.contains(PROXY_PASSWORD_KEY));
+        } finally {
+            final String logged = app.rendered();
+            final String thrown = app.renderedThrowables();
+            detachLogCapture(app);
+            assertFalse("log must not carry the credential: " + logged, logged.contains(USERINFO_CREDENTIAL));
+            assertFalse("logged throwable must not carry the credential: " + thrown, thrown.contains(USERINFO_CREDENTIAL));
+        }
+    }
+
+    @Test
+    public void test_isAvailable_userInfoApiUrlErrorIsLoggedOnce() {
+        // checkAvailabilityNow() runs on a timer in production, so an ERROR per call would flood
+        // the log for as long as the misconfiguration lasts.
+        client.setTestApiUrl(USERINFO_API_URL);
+        client.setTestApiKey("sk-test-key");
+        final ListAppender app = attachLogCapture();
+        try {
+            assertFalse(client.isAvailable());
+            assertFalse(client.isAvailable());
+            assertFalse(client.isAvailable());
+            assertEquals("the remedy must be stated once, not on every availability check", 1,
+                    app.messagesAt(org.apache.logging.log4j.Level.ERROR).size());
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_isAvailable_portBearingApiUrlIsUnaffected() throws IOException {
+        // "host:port" is a port, not userinfo: the refusal must not fire on an ordinary
+        // port-bearing gateway URL. The mock server supplies a real port-bearing authority.
+        mockServer.enqueue(new MockResponse().setBody("{\"data\":[]}").addHeader("Content-Type", "application/json"));
+        setupClientForMockServer();
+        final ListAppender app = attachLogCapture();
+        try {
+            assertTrue("a port-bearing api.url must still be usable", client.isAvailable());
+            assertEquals("no refusal may be reported for a port-bearing URL: " + app.messages(), 0,
+                    app.messagesAt(org.apache.logging.log4j.Level.ERROR).size());
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_updateAvailability_userInfoApiUrlFailsClosedInsteadOfThrowing() {
+        // The DI container runs init() as a postConstruct init method, and init() reaches
+        // checkAvailabilityNow() through startAvailabilityCheck() -> updateAvailability(). An
+        // exception escaping that frame would propagate through the eager init-method assembler
+        // and stop the application from starting, so a bad api.url must disable this one optional
+        // client, never abort startup. This pins that decision: turning the refusal into a throw
+        // reddens this test.
+        client.setTestApiUrl(USERINFO_API_URL);
+        client.setTestApiKey("sk-test-key");
+        client.testUpdateAvailability();
+        assertFalse("the client must report itself unavailable", client.isAvailable());
+    }
+
+    @Test
+    public void test_chat_userInfoApiUrlIsRefusedWithRemedy() {
+        client.setTestApiUrl(USERINFO_API_URL);
+        client.setTestApiKey("sk-test-key");
+        client.init();
+        final ListAppender app = attachLogCapture();
+        try {
+            client.chat(new LlmChatRequest().addUserMessage("Hello"));
+            fail("expected LlmException for a userinfo-bearing api.url");
+        } catch (final LlmException e) {
+            final String propagated = renderThrowable(e);
+            assertFalse("propagated exception must not carry the credential: " + propagated, propagated.contains(USERINFO_CREDENTIAL));
+            assertTrue("the supported alternative must be named: " + e.getMessage(), e.getMessage().contains(PROXY_USERNAME_KEY));
+            assertNull(e.getCause(), "cause must be absent: nothing may carry the URL");
+        } finally {
+            final String logged = app.rendered();
+            detachLogCapture(app);
+            assertFalse("log must not carry the credential: " + logged, logged.contains(USERINFO_CREDENTIAL));
+        }
+    }
+
+    @Test
+    public void test_streamChat_userInfoApiUrlIsRefusedWithRemedy() {
+        client.setTestApiUrl(USERINFO_API_URL);
+        client.setTestApiKey("sk-test-key");
+        client.init();
+        final List<Throwable> callbackErrors = new ArrayList<>();
+        final ListAppender app = attachLogCapture();
+        try {
+            client.streamChat(new LlmChatRequest().addUserMessage("Hello"), new LlmStreamCallback() {
+                @Override
+                public void onChunk(final String chunk, final boolean done) {
+                    // not reached
+                }
+
+                @Override
+                public void onError(final Throwable t) {
+                    callbackErrors.add(t);
+                }
+            });
+            fail("expected LlmException for a userinfo-bearing api.url");
+        } catch (final LlmException e) {
+            final String propagated = renderThrowable(e);
+            assertFalse("propagated exception must not carry the credential: " + propagated, propagated.contains(USERINFO_CREDENTIAL));
+            assertTrue("the supported alternative must be named: " + e.getMessage(), e.getMessage().contains(PROXY_USERNAME_KEY));
+        } finally {
+            final String logged = app.rendered();
+            detachLogCapture(app);
+            assertFalse("log must not carry the credential: " + logged, logged.contains(USERINFO_CREDENTIAL));
+        }
+        assertEquals(1, callbackErrors.size());
+        final String viaCallback = renderThrowable(callbackErrors.get(0));
+        assertFalse("callback error must not carry the credential: " + viaCallback, viaCallback.contains(USERINFO_CREDENTIAL));
+        assertTrue("callback error must name the supported alternative: " + viaCallback, viaCallback.contains(PROXY_USERNAME_KEY));
     }
 
     // ========== retry config getter tests ==========
@@ -3010,6 +3407,37 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
         List<String> messagesAt(final org.apache.logging.log4j.Level level) {
             return events.stream().filter(e -> e.getLevel().equals(level)).map(e -> e.getMessage().getFormattedMessage()).toList();
+        }
+
+        /**
+         * Everything a real appender would write out: the formatted message <em>and</em> the
+         * attached throwable. {@link #messages()} alone cannot see a throwable, so an assertion
+         * built on it goes green while the rendered log still leaks through the stack trace.
+         */
+        String rendered() {
+            final StringBuilder buf = new StringBuilder();
+            for (final LogEvent event : events) {
+                buf.append(event.getMessage().getFormattedMessage()).append('\n');
+                if (event.getThrown() != null) {
+                    buf.append(renderThrowable(event.getThrown()));
+                }
+            }
+            return buf.toString();
+        }
+
+        /**
+         * Only the attached throwables, rendered with their full cause chain. Used where the
+         * {@code url=} field of the message is itself outside the assertion's scope because the
+         * masking rules - not the exception - govern what it may contain.
+         */
+        String renderedThrowables() {
+            final StringBuilder buf = new StringBuilder();
+            for (final LogEvent event : events) {
+                if (event.getThrown() != null) {
+                    buf.append(renderThrowable(event.getThrown()));
+                }
+            }
+            return buf.toString();
         }
     }
 
@@ -3327,6 +3755,11 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         @Override
         public int getHistoryAssistantSummaryMaxChars() {
             return 800;
+        }
+
+        /** Exposes the frame the container reaches through {@code init()}, so a test can prove it never throws. */
+        void testUpdateAvailability() {
+            updateAvailability();
         }
 
         int testGetHistoryMaxChars() {
