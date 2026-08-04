@@ -5,6 +5,8 @@ OpenAI LLM Plugin for Fess
 
 This plugin provides OpenAI integration for Fess's RAG (Retrieval-Augmented Generation) features. It enables Fess to use OpenAI's reasoning models (GPT-5 and the o1/o3/o4 series) for AI-powered search capabilities including intent detection, answer generation, document summarization, and FAQ handling.
 
+It also drives any model served behind an OpenAI-compatible Chat Completions API - LiteLLM, vLLM, RamaLama, Ollama's OpenAI shim, Azure OpenAI - because every decision the client makes from the model name can be overridden explicitly. See [OpenAI-compatible endpoints](#openai-compatible-endpoints).
+
 ## Download
 
 See [Maven Repository](https://repo1.maven.org/maven2/org/codelibs/fess/fess-llm-openai/).
@@ -13,7 +15,7 @@ See [Maven Repository](https://repo1.maven.org/maven2/org/codelibs/fess/fess-llm
 
 - Fess 15.x or later
 - Java 21 or later
-- OpenAI API key
+- An OpenAI API key, or an OpenAI-compatible endpoint (see [OpenAI-compatible endpoints](#openai-compatible-endpoints); a placeholder key is still required there)
 
 ## Installation
 
@@ -35,21 +37,52 @@ table below, it is not read from `fess_config.properties`. The rest of the RAG c
 | Property | Default | Description |
 |----------|---------|-------------|
 | `rag.chat.enabled` | `false` | Enable RAG chat feature |
-| `rag.llm.openai.api.key` | - | OpenAI API key (required) |
+| `rag.llm.openai.api.key` | - | OpenAI API key (required; set any non-empty value for a keyless local endpoint, see [OpenAI-compatible endpoints](#openai-compatible-endpoints)) |
 | `rag.llm.openai.api.url` | `https://api.openai.com/v1` | OpenAI API endpoint URL |
 | `rag.llm.openai.model` | `gpt-5-mini` | Model name (e.g., `gpt-5-nano`, `gpt-5`, `o3-mini`). See [Model Support](#model-support). |
-| `rag.llm.openai.timeout` | `60000` | HTTP request timeout in milliseconds |
+| `rag.llm.openai.timeout` | `120000` | HTTP request timeout in milliseconds |
 | `rag.llm.openai.availability.check.interval` | `60` | Interval (seconds) for checking API availability |
-| `rag.llm.openai.chat.context.max.chars` | `4000` | Maximum characters for context in chat |
+| `rag.llm.openai.retry.max` | `10` | Maximum HTTP attempts (initial call plus retries) for a retryable status |
+| `rag.llm.openai.retry.base.delay.ms` | `2000` | Base delay for exponential backoff between retries |
+| `rag.llm.openai.max.concurrent.requests` | `5` | Maximum chat requests in flight to the API at once; further requests wait for a permit |
+| `rag.llm.openai.concurrency.wait.timeout` | `30000` | Milliseconds a request waits for a concurrency permit before failing with `Too many concurrent requests` |
+| `rag.llm.openai.stream.include.usage` | `true` | Request `stream_options.include_usage` on streaming calls. Set `false` for backends that reject the field. |
+| `rag.llm.openai.reasoning.model.enabled` | `auto` | Whether the model is a reasoning model. `auto` infers it from the model name (`gpt-5*`, `o1*`, `o3*`, `o4*`); `true` / `false` force it. See [Model Support](#model-support). |
+| `rag.llm.openai.temperature.enabled` | `auto` | Whether to send `temperature`. `auto` follows `reasoning.model.enabled` inverted; `true` / `false` force it. |
+| `rag.llm.openai.sampling.params.enabled` | `auto` | Whether to send `top_p`, `frequency_penalty` and `presence_penalty`. `auto` follows `reasoning.model.enabled` inverted; `true` / `false` force it. |
+| `rag.llm.openai.max.completion.tokens.enabled` | `auto` | Whether to send the token limit as `max_completion_tokens` instead of `max_tokens`. `auto` follows `reasoning.model.enabled`; `true` / `false` force it. |
+| `rag.llm.openai.reasoning.effort.enabled` | `auto` | Whether to send `reasoning_effort`. `auto` follows `reasoning.model.enabled`; `true` / `false` force it. |
+| `rag.llm.openai.reasoning.token.multiplier` | `4` | Multiplier applied to the per-prompt-type default `max_tokens` for reasoning models |
+| `rag.llm.openai.<promptType>.context.max.chars` | `16000` (`answer`, `summary`), `10000` (others) | Maximum characters of retrieved context passed to the prompt |
 | `rag.llm.openai.chat.evaluation.max.relevant.docs` | `3` | Maximum number of relevant documents for evaluation |
+| `rag.llm.openai.chat.evaluation.description.max.chars` | `500` | Maximum characters of each document description during evaluation |
+| `rag.llm.openai.history.max.chars` | `8000` | Maximum characters of conversation history |
+| `rag.llm.openai.history.assistant.max.chars` | `800` | Maximum characters kept from each assistant turn |
+| `rag.llm.openai.history.assistant.summary.max.chars` | `800` | Maximum characters kept from each assistant summary |
+| `rag.llm.openai.intent.history.max.messages` | `8` | Maximum history messages passed to the intent prompt |
+| `rag.llm.openai.intent.history.max.chars` | `4000` | Maximum history characters passed to the intent prompt |
 
 ### Per-Prompt-Type Parameters
 
-You can configure reasoning effort for each prompt type (applies to reasoning models: o1, o3, o4, gpt-5):
+You can configure these OpenAI request parameters for each prompt type; `reasoning.effort`
+applies to reasoning models by default, and `top.p`, `frequency.penalty` and `presence.penalty`
+are suppressed for them by default - every capability is independently overridable, see
+[Model Support](#model-support):
 
 | Property | Description |
 |----------|-------------|
+| `rag.llm.openai.<promptType>.temperature` | `temperature` for this prompt type, replacing the built-in per-prompt-type default. Not sent at all when the model does not accept `temperature`, and the drop is reported - see [Dropped parameters](#dropped-parameters). |
+| `rag.llm.openai.<promptType>.max.tokens` | Token limit for this prompt type, replacing the built-in per-prompt-type default. Setting it explicitly also disables the reasoning token multiplier (`rag.llm.openai.reasoning.token.multiplier`) for this prompt type - the value you write is the value sent, as `max_tokens` or `max_completion_tokens`. This is the key to raise when a reasoning model exhausts its budget on internal reasoning. |
 | `rag.llm.openai.<promptType>.reasoning.effort` | Reasoning effort level (`low`, `medium`, `high`) |
+| `rag.llm.openai.<promptType>.top.p` | Nucleus sampling `top_p` (`0.0`-`1.0`) |
+| `rag.llm.openai.<promptType>.frequency.penalty` | `frequency_penalty` (`-2.0`-`2.0`) |
+| `rag.llm.openai.<promptType>.presence.penalty` | `presence_penalty` (`-2.0`-`2.0`) |
+| `rag.llm.openai.<promptType>.thinking.budget` | **Read but ignored by this plugin.** Fess core parses it as an integer for every LLM plugin, but OpenAI's Chat Completions API has no thinking-budget field and this client never sends one. Setting it changes nothing; setting it to a non-integer value fails the request while core parses it. Use `<promptType>.max.tokens` together with `<promptType>.reasoning.effort` to control reasoning spend instead. |
+
+There is no prompt-type-less form of these keys: `rag.llm.openai.reasoning.effort` (without a
+`<promptType>` segment) is read by nothing and is silently ignored. It is also not an abbreviation
+of `rag.llm.openai.reasoning.effort.enabled`, which is the `auto`/`true`/`false` capability
+override in the [Configuration](#configuration) table and takes entirely different values.
 
 ### Content Chunk Embedding
 
@@ -123,23 +156,88 @@ Any other model name still works if you configure it - `gpt-4o`, an Azure deploy
 OpenAI-compatible gateway all take the second column below. They are simply not part of what this
 plugin is tested against.
 
-The plugin adapts the request to the model, keyed off the model name:
+By default the plugin adapts the request to the model by matching the model name:
 
-| | Reasoning models (`gpt-5*`, `o1*`, `o3*`, `o4*`) | Any other model name |
-|---|---|---|
-| Token limit parameter | `max_completion_tokens` | `max_tokens` |
-| `temperature` | Not sent - the API rejects any non-default value | Sent |
-| `top_p`, `frequency_penalty`, `presence_penalty` | Not sent - the API rejects them outright | Sent |
-| `reasoning_effort` | Supported | Not sent |
-| Default `max_tokens` | Per-prompt-type default x `rag.llm.openai.reasoning.token.multiplier` (default `4`) | Per-prompt-type default |
+| | Reasoning models (`gpt-5*`, `o1*`, `o3*`, `o4*`) | Any other model name | Override |
+|---|---|---|---|
+| Token limit parameter | `max_completion_tokens` | `max_tokens` | `rag.llm.openai.max.completion.tokens.enabled` |
+| `temperature` | Not sent - the API rejects any non-default value | Sent | `rag.llm.openai.temperature.enabled` |
+| `top_p`, `frequency_penalty`, `presence_penalty` | Not sent - the API rejects them outright | Sent | `rag.llm.openai.sampling.params.enabled` |
+| `reasoning_effort` | Supported | Not sent | `rag.llm.openai.reasoning.effort.enabled` |
+| Default `max_tokens` | Per-prompt-type default x `rag.llm.openai.reasoning.token.multiplier` (default `4`) | Per-prompt-type default | `rag.llm.openai.reasoning.model.enabled` |
 
-Configuring `rag.llm.openai.<promptType>.top.p` (or either penalty) on a reasoning model logs a
-warning and omits the parameter, rather than sending it and failing the whole chat with
-`400 Unsupported parameter`.
+Each override takes `auto` (the default), `true` or `false`. `auto` is the model-name inference
+described above: `rag.llm.openai.reasoning.model.enabled` infers the family from the name, and the other
+four follow it. `true` and `false` force the decision whatever the model is called.
 
-The second column is keyed off the model name not matching a reasoning-family prefix, so it covers
-both the older OpenAI families and any name the plugin has no knowledge of. Nothing rejects such a
-model; it just receives the classic parameter set.
+Because the five are independent, they can also be combined into a state OpenAI itself never
+produces. The one worth knowing about: `rag.llm.openai.max.completion.tokens.enabled=true` with
+`rag.llm.openai.reasoning.model.enabled` left on `auto` (or set to `false`) sends the token limit
+under the reasoning **field** name, `max_completion_tokens`, but does not apply the reasoning token
+**budget** - the `rag.llm.openai.reasoning.token.multiplier` follows `reasoning.model.enabled`
+alone. On a model that really does reason, that hands the whole unmultiplied per-prompt-type
+default (256 tokens for `intent`) to internal reasoning and returns empty content. Set
+`reasoning.model.enabled=true` whenever the model reasons, and use the other four keys only to
+correct what its endpoint accepts.
+
+#### Dropped parameters
+
+Configuring `rag.llm.openai.<promptType>.temperature`, `.top.p`, `.frequency.penalty`,
+`.presence.penalty` or `.reasoning.effort` on a model that does not accept it logs a warning and
+omits the parameter, rather than sending it and failing the whole chat with
+`400 Unsupported parameter`:
+
+```
+WARN [LLM:OPENAI] top_p is not supported by model gpt-5-mini and was not sent.
+     Remove the rag.llm.openai.<promptType>.top.p setting for this model.
+```
+
+The warning names the OpenAI field, the resolved model, and the configuration key to edit - note
+that the key spells the field with dots (`top.p`, `frequency.penalty`, `presence.penalty`), so grep
+for that form rather than for the wire name. It is emitted **once per parameter and model**, not
+once per request: one RAG search issues several LLM calls, so repeating it would cost several log
+lines per user search for as long as the misconfiguration lasts. Changing the model reports the
+drop afresh.
+
+Only a value *you* configured is reported. The client's own per-prompt-type default `temperature`
+is withdrawn quietly when the model does not accept temperature, because that is the client's
+decision rather than a misconfiguration. Either way the request sent is identical.
+
+### OpenAI-compatible endpoints
+
+Behind LiteLLM, vLLM, RamaLama, Ollama's OpenAI shim or an Azure deployment, the model name
+carries no OpenAI semantics, so the name-based inference above cannot classify it. Set the
+overrides explicitly instead. A reasoning model such as Qwen3 served by vLLM is reasoning, yet it
+accepts `temperature` and `top_p`, expects `max_tokens`, and has no `reasoning_effort` field:
+
+```properties
+rag.llm.openai.api.url=http://localhost:8000/v1
+rag.llm.openai.api.key=dummy
+rag.llm.openai.model=qwen3-32b
+rag.llm.openai.reasoning.model.enabled=true
+rag.llm.openai.temperature.enabled=true
+rag.llm.openai.sampling.params.enabled=true
+rag.llm.openai.max.completion.tokens.enabled=false
+rag.llm.openai.reasoning.effort.enabled=false
+```
+
+Setting `rag.llm.openai.reasoning.model.enabled` alone is enough when the endpoint follows OpenAI's own
+parameter rules - the other four keys default to following it.
+
+Notes for these deployments:
+
+- The properties above live in `fess_config.properties`. They are not read at startup: each key is
+  resolved the first time something asks for it, and a resolved value is then cached for the
+  lifetime of the running instance (a key that is absent is not cached, and is re-resolved on every
+  call). Either way, restart Fess after editing.
+  `-Dfess.config.rag.llm.openai.<key>=<value>` works as a JVM-level override.
+- `rag.llm.openai.api.key` must be non-empty even when the endpoint needs no credential: a blank
+  key makes the availability check report the client unavailable. Any placeholder works.
+- `rag.llm.openai.api.url` must not end with a trailing slash.
+- Set `rag.llm.openai.stream.include.usage=false` if the backend rejects `stream_options`.
+- The availability check calls `GET <api.url>/models`; the endpoint must implement it.
+- Servers that end a completion with a `finish_reason` other than `stop` (for example `eos` or
+  `end_turn`) produce a `Chat finished abnormally` warning on every call. It is harmless.
 
 > **Note on `reasoning.effort`.** Raising it for the `intent` or `evaluation` prompt types without
 > also raising the token budget can consume the entire allowance on internal reasoning and return
@@ -156,7 +254,7 @@ model; it just receives the classic parameter set.
 - **Relevance Evaluation** - Identifies the most relevant documents for answer generation
 - **Streaming Support** - Real-time response streaming via Server-Sent Events (SSE)
 - **Availability Checking** - Validates API availability at configurable intervals
-- **Reasoning Model Support** - Adaptive parameter handling for gpt-5 and o1/o3/o4 reasoning models
+- **Reasoning Model Support** - Adaptive parameter handling for gpt-5 and o1/o3/o4 reasoning models, with per-capability overrides for models served through OpenAI-compatible APIs
 
 ## OpenAI API Endpoints Used
 
