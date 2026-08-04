@@ -22,8 +22,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 import org.apache.hc.client5.http.classic.methods.HttpGet;
@@ -35,6 +38,7 @@ import org.apache.hc.core5.http.io.entity.StringEntity;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.codelibs.core.lang.StringUtil;
+import org.codelibs.fess.Constants;
 import org.codelibs.fess.llm.AbstractLlmClient;
 import org.codelibs.fess.llm.LlmChatRequest;
 import org.codelibs.fess.llm.LlmChatResponse;
@@ -66,6 +70,44 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     protected static final String NAME = "openai";
     private static final String SSE_DATA_PREFIX = "data: ";
     private static final String SSE_DONE_MARKER = "[DONE]";
+
+    /** Config key suffix forcing {@link #isReasoningModel(String)}. */
+    private static final String CONFIG_REASONING_MODEL_ENABLED = "reasoning.model.enabled";
+    /** Config key suffix forcing {@link #supportsTemperature(String)}. */
+    private static final String CONFIG_TEMPERATURE_ENABLED = "temperature.enabled";
+    /** Config key suffix forcing {@link #supportsSamplingParams(String)}. */
+    private static final String CONFIG_SAMPLING_PARAMS_ENABLED = "sampling.params.enabled";
+    /** Config key suffix forcing {@link #useMaxCompletionTokens(String)}. */
+    private static final String CONFIG_MAX_COMPLETION_TOKENS_ENABLED = "max.completion.tokens.enabled";
+    /** Config key suffix forcing {@link #supportsReasoningEffort(String)}. */
+    private static final String CONFIG_REASONING_EFFORT_ENABLED = "reasoning.effort.enabled";
+
+    /**
+     * Capability keys already reported as carrying an unrecognized value, held as
+     * {@code <keySuffix>=<value>} tokens. The capability predicates run on every request, so a
+     * single misconfiguration would otherwise WARN on every call for as long as it lasts. Mirrors
+     * the intent of the one-shot guard in {@link #isUserInfoApiUrlRefused(String)}.
+     */
+    private final Set<String> warnedCapabilityValues = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Request parameters already reported as dropped because the resolved model does not accept
+     * them, held as {@code <field>@<model>} tokens.
+     *
+     * <p>Kept separate from {@link #warnedCapabilityValues} rather than sharing it under a key
+     * prefix: the two guard different things - an unrecognized <em>configuration value</em> versus
+     * a <em>wire parameter</em> that was suppressed. A second set says that in the declaration
+     * itself, where a shared set would rest on a prefix convention that a later edit can break
+     * without anything noticing.
+     *
+     * <p>Deduplication is needed for the same reason it is needed there: a single RAG search issues
+     * several LLM calls (intent, evaluation, optional query regeneration, answer), so an
+     * undeduplicated WARN costs several log lines per user search for as long as the
+     * misconfiguration lasts. The model is part of the key so a changed model reports afresh, and
+     * the set stays small: the model comes from configuration, never from user input
+     * ({@link LlmChatRequest#setModel(String)} has no caller in Fess core).
+     */
+    private final Set<String> warnedDroppedParams = ConcurrentHashMap.newKeySet();
 
     /**
      * Default constructor.
@@ -763,6 +805,23 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     }
 
     /**
+     * Resolves the model name a request runs against: the per-request model when set, otherwise
+     * the configured {@code rag.llm.openai.model}.
+     *
+     * <p>{@link #buildRequestBody(LlmChatRequest, boolean)} and
+     * {@link #applyDefaultParams(LlmChatRequest, String)} must agree on this string, because both
+     * feed it to the capability predicates. Resolving it two different ways let the reasoning
+     * token multiplier be chosen for one model while the wire parameters were chosen for another.
+     *
+     * @param request the chat request, which may carry a per-request model override.
+     * @return the model name to send and to classify; never blank unless the configuration is.
+     */
+    protected String resolveModel(final LlmChatRequest request) {
+        final String model = request.getModel();
+        return StringUtil.isBlank(model) ? getModel() : model;
+    }
+
+    /**
      * Builds the request body for the OpenAI API.
      *
      * @param request the chat request
@@ -772,10 +831,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     protected Map<String, Object> buildRequestBody(final LlmChatRequest request, final boolean stream) {
         final Map<String, Object> body = new HashMap<>();
 
-        String model = request.getModel();
-        if (StringUtil.isBlank(model)) {
-            model = getModel();
-        }
+        final String model = resolveModel(request);
         body.put("model", model);
 
         final List<Map<String, String>> messages = request.getMessages().stream().map(this::convertMessage).collect(Collectors.toList());
@@ -789,8 +845,18 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             body.put("stream_options", streamOptions);
         }
 
-        if (supportsTemperature(model) && request.getTemperature() != null) {
-            body.put("temperature", request.getTemperature());
+        if (request.getTemperature() != null) {
+            if (supportsTemperature(model)) {
+                body.put("temperature", request.getTemperature());
+            } else if (shouldWarnDroppedParam("temperature", model)) {
+                // Same reasoning as putDoubleParam and reasoning_effort below: only an explicit
+                // rag.llm.openai.<promptType>.temperature setting can still reach this branch,
+                // because applyDefaultParams clears its own auto-applied default for a model that
+                // does not accept temperature. Dropping an operator's value in silence reads as
+                // "applied".
+                logger.warn("[LLM:OPENAI] temperature is not supported by model {} and was not sent. Remove the "
+                        + "{}.<promptType>.temperature setting for this model.", model, getConfigPrefix());
+            }
         }
 
         final String maxTokensKey = useMaxCompletionTokens(model) ? "max_completion_tokens" : "max_tokens";
@@ -798,10 +864,19 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             body.put(maxTokensKey, request.getMaxTokens());
         }
 
-        if (isReasoningModel(model)) {
-            final String reasoningEffort = request.getExtraParam("reasoning_effort");
-            if (reasoningEffort != null) {
+        final String reasoningEffort = request.getExtraParam("reasoning_effort");
+        if (reasoningEffort != null) {
+            if (supportsReasoningEffort(model)) {
                 body.put("reasoning_effort", reasoningEffort);
+            } else if (shouldWarnDroppedParam("reasoning_effort", model)) {
+                // Symmetric with putDoubleParam: the value came from an explicit
+                // rag.llm.openai.<promptType>.reasoning.effort setting, and a silent drop reads as
+                // "applied". applyDefaultParams gates its auto-applied "low" on the same predicate,
+                // so a value this client chose itself can never reach this branch.
+                logger.warn(
+                        "[LLM:OPENAI] reasoning_effort is not supported by model {} and was not sent. Remove the "
+                                + "{}.<promptType>.reasoning.effort setting for this model, or set {}.{}=true.",
+                        model, getConfigPrefix(), getConfigPrefix(), CONFIG_REASONING_EFFORT_ENABLED);
             }
         }
 
@@ -834,8 +909,14 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         if (!supported) {
             // Warn rather than drop silently: the value came from an explicit
             // rag.llm.openai.<promptType>.<name> setting, and silence would read as "ignored".
-            logger.warn("[LLM:OPENAI] {} is not supported by model {} and was not sent. Remove the "
-                    + "rag.llm.openai.*.{} setting for this model.", name, model, name);
+            // The config key is the wire field with underscores replaced by dots - top_p is
+            // configured as top.p, frequency_penalty as frequency.penalty and presence_penalty as
+            // presence.penalty - so the wire name must not be printed in the key position: an
+            // operator who greps their configuration for it finds nothing.
+            if (shouldWarnDroppedParam(name, model)) {
+                logger.warn("[LLM:OPENAI] {} is not supported by model {} and was not sent. Remove the "
+                        + "{}.<promptType>.{} setting for this model.", name, model, getConfigPrefix(), name.replace('_', '.'));
+            }
             return;
         }
         try {
@@ -843,6 +924,18 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         } catch (final NumberFormatException e) {
             logger.warn("[LLM:OPENAI] Invalid {} value: {}", name, value);
         }
+    }
+
+    /**
+     * Returns whether a "parameter was not sent" WARN still has to be emitted for this parameter
+     * and model, recording the pair when it has.
+     *
+     * @param field the OpenAI request-body field that was dropped.
+     * @param model the resolved model name the drop was decided against.
+     * @return true the first time this parameter is dropped for this model, false afterwards.
+     */
+    private boolean shouldWarnDroppedParam(final String field, final String model) {
+        return warnedDroppedParams.add(field + "@" + model);
     }
 
     /**
@@ -854,22 +947,29 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * equivalent for both penalties. This mirrors {@link #supportsTemperature(String)}, which
      * already guards the fourth member of the same group.
      *
+     * <p>Override with {@code rag.llm.openai.sampling.params.enabled} when the model is served
+     * through an OpenAI-compatible endpoint whose sampling support does not follow OpenAI's
+     * reasoning-model rule.
+     *
      * @param model the model name.
      * @return true if the model supports the sampling parameters.
      */
     protected boolean supportsSamplingParams(final String model) {
-        return !isReasoningModel(model);
+        return resolveCapability(CONFIG_SAMPLING_PARAMS_ENABLED, () -> !isReasoningModel(model));
     }
 
     /**
      * Determines whether the given model requires the "max_completion_tokens" parameter
      * instead of the legacy "max_tokens" parameter.
      *
+     * <p>Override with {@code rag.llm.openai.max.completion.tokens.enabled}; many
+     * OpenAI-compatible servers expect {@code max_tokens} even for reasoning models.
+     *
      * @param model the model name
      * @return true if the model uses max_completion_tokens
      */
     protected boolean useMaxCompletionTokens(final String model) {
-        return isReasoningModel(model);
+        return resolveCapability(CONFIG_MAX_COMPLETION_TOKENS_ENABLED, () -> isReasoningModel(model));
     }
 
     /**
@@ -877,31 +977,64 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * Reasoning models (o1, o3, o4, gpt-5 series) do not support custom temperature values.
      * Only the default value (1) is accepted by these models.
      *
+     * <p>Override with {@code rag.llm.openai.temperature.enabled}; a non-OpenAI reasoning model
+     * behind a compatible endpoint commonly does accept temperature.
+     *
      * @param model the model name
      * @return true if the model supports custom temperature values
      */
     protected boolean supportsTemperature(final String model) {
-        return !isReasoningModel(model);
+        return resolveCapability(CONFIG_TEMPERATURE_ENABLED, () -> !isReasoningModel(model));
+    }
+
+    /**
+     * Determines whether the given model accepts OpenAI's {@code reasoning_effort} parameter.
+     *
+     * <p>Kept separate from {@link #isReasoningModel(String)} because the two are not the same
+     * question outside OpenAI: a reasoning model served by vLLM or LiteLLM benefits from the
+     * reasoning token budget while rejecting {@code reasoning_effort}, which is an OpenAI-specific
+     * field. Override with {@code rag.llm.openai.reasoning.effort.enabled}.
+     *
+     * @param model the model name
+     * @return true if {@code reasoning_effort} may be sent for this model
+     */
+    protected boolean supportsReasoningEffort(final String model) {
+        return resolveCapability(CONFIG_REASONING_EFFORT_ENABLED, () -> isReasoningModel(model));
     }
 
     /**
      * Determines whether the given model is a reasoning model that uses internal
      * reasoning tokens (e.g., o1, o3, o4, gpt-5 series).
      *
+     * <p>Defaults to {@link #isReasoningModelName(String)}, a prefix match on OpenAI's model
+     * names, which says nothing about a model served through an OpenAI-compatible API - a LiteLLM
+     * route, a vLLM deployment or an Azure deployment name. Set
+     * {@code rag.llm.openai.reasoning.model.enabled} to {@code true} or {@code false} to classify
+     * such a model explicitly.
+     *
      * @param model the model name
      * @return true if the model is a reasoning model
      */
     protected boolean isReasoningModel(final String model) {
+        return resolveCapability(CONFIG_REASONING_MODEL_ENABLED, () -> isReasoningModelName(model));
+    }
+
+    /**
+     * The model-name rule behind {@link #isReasoningModel(String)}: OpenAI's own reasoning
+     * families. Kept separate so the inference stays testable independently of the override that
+     * can replace it.
+     *
+     * @param model the model name
+     * @return true if the name belongs to an OpenAI reasoning family
+     */
+    protected static boolean isReasoningModelName(final String model) {
         if (StringUtil.isBlank(model)) {
             return false;
         }
         if (model.startsWith("o1") || model.startsWith("o3") || model.startsWith("o4")) {
             return true;
         }
-        if (model.startsWith("gpt-5")) {
-            return true;
-        }
-        return false;
+        return model.startsWith("gpt-5");
     }
 
     /**
@@ -915,6 +1048,86 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         map.put("role", message.getRole());
         map.put("content", message.getContent());
         return map;
+    }
+
+    /**
+     * Reads a String configuration value under this client's config prefix.
+     *
+     * <p>Uses {@code getOrDefault}, i.e. {@code fess_config.properties} plus the
+     * {@code -Dfess.config.*} JVM override - the same channel as every other
+     * {@code rag.llm.openai.*} property. This deliberately does <em>not</em> reuse
+     * {@code AbstractEmbeddingClient#getConfigString}, which reads {@code conf/system.properties}:
+     * putting a {@code rag.llm.openai.*} key on that channel would make it unsettable next to
+     * {@code rag.llm.openai.model} and {@code api.url}.
+     *
+     * @param keySuffix the key suffix appended to {@link #getConfigPrefix()} and a dot.
+     * @param defaultValue the value to return when the key is absent.
+     * @return the configured value, or {@code defaultValue} when the key is absent.
+     */
+    protected String getConfigString(final String keySuffix, final String defaultValue) {
+        return ComponentUtil.getFessConfig().getOrDefault(getConfigPrefix() + "." + keySuffix, defaultValue);
+    }
+
+    /**
+     * Resolves an {@code auto} / {@code true} / {@code false} capability override.
+     *
+     * <p>{@code auto} - the default - means "infer from the model name", which is what every
+     * capability predicate did unconditionally before these properties existed. An explicit
+     * {@code true} or {@code false} forces the capability whatever the model is called, which is
+     * what an OpenAI-compatible endpoint needs: behind LiteLLM, vLLM, RamaLama or an Azure
+     * deployment the model name carries no OpenAI semantics, so prefix matching cannot classify
+     * it.
+     *
+     * <p>A blank value is treated as {@code auto} in silence - {@code key=} in a properties file
+     * reads as "left in place but unset". Any other unrecognized value degrades to {@code auto}
+     * rather than to {@code false}, so a typo cannot silently switch a capability off, and is
+     * reported once per distinct key/value pair.
+     *
+     * <p>{@link org.codelibs.fess.embedding.openai.OpenAiEmbeddingClient#supportsDimensionsParam(String)}
+     * is the sibling implementation of the same {@code auto} / {@code true} / {@code false} pattern
+     * in this plugin, and this method deliberately diverges from it twice. It WARNs on a blank
+     * value, where this method takes blank as a silent {@code auto}: {@code key=} in a properties
+     * file reads as "left in place but unset", not as a typo, so it is not worth a log line. And it
+     * WARNs on every call, where this method deduplicates per key/value pair: these predicates run
+     * on every request, so an undeduplicated WARN would flood the log for as long as the
+     * misconfiguration lasts. Neither divergence is accidental; do not "align" them by copying the
+     * embedding client's behavior here.
+     *
+     * @param keySuffix the capability key suffix under {@link #getConfigPrefix()}.
+     * @return {@link Boolean#TRUE} or {@link Boolean#FALSE} when the capability is forced,
+     *         {@code null} when the caller should infer it from the model name.
+     */
+    protected Boolean getCapabilityOverride(final String keySuffix) {
+        final String value = getConfigString(keySuffix, Constants.AUTO);
+        if (Constants.TRUE.equalsIgnoreCase(value)) {
+            return Boolean.TRUE;
+        }
+        if (Constants.FALSE.equalsIgnoreCase(value)) {
+            return Boolean.FALSE;
+        }
+        if (StringUtil.isBlank(value) || Constants.AUTO.equalsIgnoreCase(value)) {
+            return null;
+        }
+        if (warnedCapabilityValues.add(keySuffix + "=" + value)) {
+            logger.warn("[LLM:OPENAI] Invalid {}.{} value: {}. Using {}.", getConfigPrefix(), keySuffix, value, Constants.AUTO);
+        }
+        return null;
+    }
+
+    /**
+     * Resolves a capability from its override property, falling back to a model-name inference.
+     *
+     * <p>The inference is a supplier rather than a value so it is not evaluated - and so its own
+     * override lookup cannot log - when an explicit {@code true} / {@code false} already decides
+     * the answer.
+     *
+     * @param keySuffix the capability key suffix under {@link #getConfigPrefix()}.
+     * @param inference the model-name rule to apply when the property is on {@code auto}.
+     * @return the resolved capability.
+     */
+    private boolean resolveCapability(final String keySuffix, final BooleanSupplier inference) {
+        final Boolean override = getCapabilityOverride(keySuffix);
+        return override != null ? override.booleanValue() : inference.getAsBoolean();
     }
 
     /**
@@ -980,14 +1193,21 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * Applies default generation parameters based on prompt type.
      * Only sets defaults when user has not configured the parameter.
      * For reasoning models, multiplies the default max tokens to account for
-     * internal reasoning token consumption, and sets reasoning_effort to "low"
-     * for simple classification tasks.
+     * internal reasoning token consumption. For models where
+     * {@link #supportsReasoningEffort(String)} resolves true, also sets reasoning_effort to
+     * "low" for simple classification tasks.
+     *
+     * <p>A default temperature this method applied is withdrawn again when
+     * {@link #supportsTemperature(String)} resolves false for the model, so that the drop in
+     * {@link #buildRequestBody(LlmChatRequest, boolean)} - which WARNs - can only ever concern a
+     * value an operator configured. The request sent is identical either way.
      *
      * @param request the LLM chat request
      * @param promptType the prompt type (e.g. "intent", "evaluation", "answer")
      */
     protected void applyDefaultParams(final LlmChatRequest request, final String promptType) {
         final boolean maxTokensSetByUser = request.getMaxTokens() != null;
+        final boolean temperatureSetByUser = request.getTemperature() != null;
         switch (promptType) {
         case "intent":
         case "evaluation":
@@ -1052,8 +1272,22 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             break;
         }
 
-        // For reasoning models, apply token multiplier and default reasoning_effort
-        final String model = getModel();
+        // Resolved the same way buildRequestBody resolves it, so the multiplier and the wire
+        // parameters can never be chosen for two different models.
+        final String model = resolveModel(request);
+
+        // Withdraw the default this method just applied when the model does not accept
+        // temperature. buildRequestBody would drop it anyway, so the wire body is unchanged; what
+        // changes is that the drop there now only ever concerns a value an operator set, which is
+        // what makes warning about it there correct rather than noise. Mirrors how the auto
+        // reasoning_effort is gated on supportsReasoningEffort before it is applied at all.
+        if (!temperatureSetByUser && !supportsTemperature(model)) {
+            request.setTemperature(null);
+            if (logger.isDebugEnabled()) {
+                logger.debug("[LLM:OPENAI] Withdrew the default temperature. promptType={}, model={}", promptType, model);
+            }
+        }
+
         if (isReasoningModel(model)) {
             // Multiply default max tokens if not explicitly set by user
             if (!maxTokensSetByUser && request.getMaxTokens() != null) {
@@ -1064,24 +1298,26 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                             request.getMaxTokens(), multiplier);
                 }
             }
+        }
 
-            // Set default reasoning_effort for simple tasks
-            if (request.getExtraParam("reasoning_effort") == null) {
-                switch (promptType) {
-                case "intent":
-                case "evaluation":
-                case "docnotfound":
-                case "unclear":
-                case "noresults":
-                case "queryregeneration":
-                    request.putExtraParam("reasoning_effort", "low");
-                    if (logger.isDebugEnabled()) {
-                        logger.debug("[LLM:OPENAI] Applied default reasoning_effort=low. promptType={}", promptType);
-                    }
-                    break;
-                default:
-                    break;
+        // Gated on supportsReasoningEffort, not on isReasoningModel: a compatible endpoint can
+        // want the reasoning token budget while rejecting the OpenAI-only reasoning_effort field.
+        // buildRequestBody re-checks the same predicate, so the two cannot disagree.
+        if (supportsReasoningEffort(model) && request.getExtraParam("reasoning_effort") == null) {
+            switch (promptType) {
+            case "intent":
+            case "evaluation":
+            case "docnotfound":
+            case "unclear":
+            case "noresults":
+            case "queryregeneration":
+                request.putExtraParam("reasoning_effort", "low");
+                if (logger.isDebugEnabled()) {
+                    logger.debug("[LLM:OPENAI] Applied default reasoning_effort=low. promptType={}", promptType);
                 }
+                break;
+            default:
+                break;
             }
         }
     }

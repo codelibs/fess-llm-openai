@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OpenAI LLM plugin for [Fess](https://github.com/codelibs/fess) enterprise search server. Implements the `AbstractLlmClient` interface to integrate OpenAI models into Fess's RAG (Retrieval-Augmented Generation) pipeline. Single-class plugin with `OpenAiLlmClient` as the sole production class.
+OpenAI LLM plugin for [Fess](https://github.com/codelibs/fess) enterprise search server. Implements the `AbstractLlmClient` interface to integrate OpenAI models into Fess's RAG (Retrieval-Augmented Generation) pipeline. Two production clients: `OpenAiLlmClient` (RAG chat) and `OpenAiEmbeddingClient` (content-chunk embedding).
 
 ## Build Commands
 
@@ -29,7 +29,7 @@ cd /path/to/fess-parent && mvn install -Dgpg.skip=true
 - **`OpenAiLlmClient`** (`src/main/java/.../openai/OpenAiLlmClient.java`) - Extends `AbstractLlmClient` from fess core. Handles:
   - Synchronous and streaming (SSE) chat completions via `/v1/chat/completions`
   - Availability checking via `/v1/models`
-  - Model-aware parameter handling: reasoning models (o1/o3/o4/gpt-5) use `max_completion_tokens` instead of `max_tokens`, don't support `temperature`, and accept `reasoning_effort`
+  - Model-aware parameter handling: reasoning models (o1/o3/o4/gpt-5) use `max_completion_tokens` instead of `max_tokens`, don't support `temperature`, and accept `reasoning_effort`. Every one of those decisions can be forced with an `auto`/`true`/`false` property - see [Reasoning models](#reasoning-models)
   - Per-prompt-type default parameters (temperature, max_tokens) via `applyDefaultParams()`
   - Configuration read from `fess_config.properties` via `ComponentUtil.getFessConfig()` with prefix `rag.llm.openai`
 
@@ -115,19 +115,77 @@ older proxies, custom vLLM deployments) that reject this field.
 ### Reasoning models
 
 Reasoning models (`o1*`, `o3*`, `o4*`, `gpt-5*`) are the supported set; `gpt-5-nano` is
-what the plugin is exercised against. `isReasoningModel()` is the single predicate for the
-family - `useMaxCompletionTokens()` and `supportsTemperature()` delegate to it, so the three
-cannot drift apart. It gates `max_completion_tokens` (in place of `max_tokens`),
+what the plugin is exercised against. `isReasoningModel()` is the default predicate for the
+family - `useMaxCompletionTokens()`, `supportsTemperature()`, `supportsSamplingParams()` and
+`supportsReasoningEffort()` all derive from it when their own key is on `auto`, so the five
+cannot drift apart by accident. It gates `max_completion_tokens` (in place of `max_tokens`),
 `reasoning_effort`, and the suppression of `temperature`, `top_p`, `frequency_penalty` and
 `presence_penalty`, all four of which these models reject with
 `400 Unsupported parameter`. A suppressed parameter WARNs rather than being dropped
 silently, since it came from an explicit `rag.llm.openai.<promptType>.*` setting.
+
+Three things about those WARNs are load-bearing and easy to undo by accident:
+
+- **The key they name is not the wire field.** `top_p` is configured as
+  `rag.llm.openai.<promptType>.top.p`, and likewise `frequency.penalty` / `presence.penalty`;
+  `putDoubleParam` renders it with `name.replace('_', '.')`. Interpolating the raw field name into
+  the key slot produces a key that exists nowhere, which an operator greps for and never finds.
+- **They are deduplicated per parameter *and* resolved model** (`warnedDroppedParams`), for the
+  same reason `getCapabilityOverride` deduplicates: one RAG search issues several LLM calls
+  (intent, evaluation, optional query regeneration, answer), so an undeduplicated WARN costs
+  several lines per user search forever. The model is part of the key so a model change reports
+  afresh. Keep `warnedDroppedParams` separate from `warnedCapabilityValues` - the two guard
+  different things (a bad config *value* versus a suppressed *wire parameter*).
+- **Only an operator's value may reach a drop.** `applyDefaultParams` withdraws the
+  per-prompt-type `temperature` it applied itself when `supportsTemperature()` resolves false, the
+  same way it gates its auto `reasoning_effort` on `supportsReasoningEffort()`. Without that, the
+  WARN would fire on the client's own default and be pure noise. The withdrawal never changes the
+  request: `buildRequestBody` dropped that value at the wire either way.
+
+`rag.llm.openai.<promptType>.thinking.budget` is read and `Integer.parseInt`ed by
+`AbstractLlmClient#applyPromptTypeParams` for every LLM plugin, but `buildRequestBody` never reads
+`getThinkingBudget()` back - the OpenAI Chat Completions API has no such field. It is inert here
+except that a non-integer value still throws while core parses it.
+
+Each of the five is independently overridable, because a model behind an OpenAI-compatible API
+(LiteLLM, vLLM, RamaLama, Azure deployment names) does not follow OpenAI's bundling - a reasoning
+Qwen3 on vLLM accepts `temperature` and `top_p`, expects `max_tokens`, and has no
+`reasoning_effort`:
+
+| Property | Overrides | `auto` resolves to |
+|---|---|---|
+| `rag.llm.openai.reasoning.model.enabled` | `isReasoningModel()` | model-name prefix match |
+| `rag.llm.openai.temperature.enabled` | `supportsTemperature()` | `!isReasoningModel()` |
+| `rag.llm.openai.sampling.params.enabled` | `supportsSamplingParams()` | `!isReasoningModel()` |
+| `rag.llm.openai.max.completion.tokens.enabled` | `useMaxCompletionTokens()` | `isReasoningModel()` |
+| `rag.llm.openai.reasoning.effort.enabled` | `supportsReasoningEffort()` | `isReasoningModel()` |
+
+Values are `auto` (default) / `true` / `false`, case-insensitive; a blank value is `auto`, and any
+other unrecognized value degrades to `auto` with a WARN emitted once per key/value - never to
+`false`, so a typo cannot silently disable a capability. They are read with
+`getConfigString(suffix, default)`, which goes through `getOrDefault`
+(`fess_config.properties` / `-Dfess.config.*`). Do **not** switch this to
+`AbstractEmbeddingClient#getConfigString`: that helper reads `conf/system.properties`, a different
+channel from every other `rag.llm.openai.*` key. `OpenAiLlmClientCapabilityConfigTest` exists to
+catch exactly that regression.
+
+With `rag.llm.openai.reasoning.model.enabled=true`, a blank model name classifies as a reasoning model,
+because the explicit override short-circuits before the blank check that the name inference
+(`isReasoningModelName()`) applies; on `auto` a blank model name is still not a reasoning model.
 
 For these models the per-prompt-type default `max_tokens` is multiplied by
 `rag.llm.openai.reasoning.token.multiplier` (default `4`) so internal reasoning-token spend
 does not crowd out visible output. Raising `reasoning.effort` on the short `intent` /
 `evaluation` prompts can still exhaust the budget on reasoning alone and return empty
 content - the `Chat finished abnormally ... contentLength=0` WARN is the signal.
+
+That multiplier follows `reasoning.model.enabled` **alone**, not
+`max.completion.tokens.enabled`. So `max.completion.tokens.enabled=true` with
+`reasoning.model.enabled` on `auto`/`false` produces the reasoning token *field* without the
+reasoning token *budget* - measured on `gpt-5-nano`, `intent` sends `max_completion_tokens=256`
+rather than `1024`. On a model that really reasons, the whole budget then goes to internal
+reasoning and the answer comes back empty. It is a legal combination, so nothing warns; the
+README says so under Model Support.
 
 ## Testing
 

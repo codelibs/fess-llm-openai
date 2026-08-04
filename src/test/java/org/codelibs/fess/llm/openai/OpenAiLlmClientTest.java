@@ -40,6 +40,9 @@ import org.codelibs.fess.unit.UnitFessTestCase;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 import okhttp3.mockwebserver.RecordedRequest;
@@ -265,6 +268,261 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             assertTrue("'" + model + "' must accept temperature", client.supportsTemperature(model));
             assertTrue("'" + model + "' must accept sampling params", client.supportsSamplingParams(model));
         }
+    }
+
+    @Test
+    public void test_getCapabilityOverride_defaultsToAuto() {
+        // Unset means "infer from the model name" -- null, not FALSE. Returning FALSE here would
+        // silently force every capability off for every existing deployment.
+        assertNull(client.getCapabilityOverride("reasoning.model.enabled"));
+    }
+
+    @Test
+    public void test_getCapabilityOverride_explicitAutoIsNull() {
+        client.setTestConfig("reasoning.model.enabled", "auto");
+        assertNull(client.getCapabilityOverride("reasoning.model.enabled"));
+    }
+
+    @Test
+    public void test_getCapabilityOverride_forcedTrueAndFalse() {
+        client.setTestConfig("reasoning.model.enabled", "true");
+        assertEquals(Boolean.TRUE, client.getCapabilityOverride("reasoning.model.enabled"));
+        client.setTestConfig("reasoning.model.enabled", "false");
+        assertEquals(Boolean.FALSE, client.getCapabilityOverride("reasoning.model.enabled"));
+    }
+
+    @Test
+    public void test_getCapabilityOverride_isCaseInsensitive() {
+        client.setTestConfig("reasoning.model.enabled", "TRUE");
+        assertEquals(Boolean.TRUE, client.getCapabilityOverride("reasoning.model.enabled"));
+        client.setTestConfig("reasoning.model.enabled", "False");
+        assertEquals(Boolean.FALSE, client.getCapabilityOverride("reasoning.model.enabled"));
+        client.setTestConfig("reasoning.model.enabled", "AUTO");
+        assertNull(client.getCapabilityOverride("reasoning.model.enabled"));
+    }
+
+    @Test
+    public void test_getCapabilityOverride_blankIsAutoWithoutWarning() {
+        // "key=" in a properties file reads as "left in place but unset", not as a typo.
+        client.setTestConfig("reasoning.model.enabled", "");
+        final ListAppender app = attachLogCapture();
+        try {
+            assertNull(client.getCapabilityOverride("reasoning.model.enabled"));
+            assertTrue("blank must not WARN", app.messagesAt(org.apache.logging.log4j.Level.WARN).isEmpty());
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_getCapabilityOverride_unrecognizedDegradesToAutoAndWarnsOnce() {
+        // Degrades to auto, not to false: a typo must not silently disable a capability. The
+        // predicates run on every request, so the WARN is deduplicated per key/value.
+        client.setTestConfig("reasoning.model.enabled", "ture");
+        final ListAppender app = attachLogCapture();
+        try {
+            assertNull(client.getCapabilityOverride("reasoning.model.enabled"));
+            assertNull(client.getCapabilityOverride("reasoning.model.enabled"));
+            assertNull(client.getCapabilityOverride("reasoning.model.enabled"));
+            final java.util.List<String> warns = app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                    .stream()
+                    .filter(s -> s.contains("rag.llm.openai.reasoning.model.enabled") && s.contains("ture"))
+                    .toList();
+            assertEquals("an unrecognized value must WARN exactly once", 1, warns.size());
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_getCapabilityOverride_warnsAgainForADifferentBadValue() {
+        final ListAppender app = attachLogCapture();
+        try {
+            client.setTestConfig("reasoning.model.enabled", "ture");
+            client.getCapabilityOverride("reasoning.model.enabled");
+            client.setTestConfig("reasoning.model.enabled", "yes");
+            client.getCapabilityOverride("reasoning.model.enabled");
+            final java.util.List<String> warns = app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                    .stream()
+                    .filter(s -> s.contains("rag.llm.openai.reasoning.model.enabled"))
+                    .toList();
+            assertEquals("a second distinct bad value must be reported", 2, warns.size());
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_getCapabilityOverride_dedupIsKeyedByKeyAndValueNotByValueAlone() {
+        // The dedup token is "<keySuffix>=<value>". Keyed by the value alone, the same typo under
+        // a second key would be swallowed and that misconfiguration would never be reported --
+        // and every other test here would stay green, because they all vary the value under one
+        // key. So this varies the key under one value.
+        final ListAppender app = attachLogCapture();
+        try {
+            client.setTestConfig("reasoning.model.enabled", "ture");
+            client.setTestConfig("temperature.enabled", "ture");
+            client.getCapabilityOverride("reasoning.model.enabled");
+            client.getCapabilityOverride("temperature.enabled");
+            final java.util.List<String> warns =
+                    app.messagesAt(org.apache.logging.log4j.Level.WARN).stream().filter(s -> s.contains("value: ture")).toList();
+            assertEquals("the same bad value under two keys must be reported once per key, warns=" + warns, 2, warns.size());
+            assertTrue("reasoning.model.enabled must be named by its own WARN, warns=" + warns,
+                    warns.stream().anyMatch(s -> s.contains("rag.llm.openai.reasoning.model.enabled")));
+            assertTrue("temperature.enabled must be named by its own WARN, warns=" + warns,
+                    warns.stream().anyMatch(s -> s.contains("rag.llm.openai.temperature.enabled")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_isReasoningModelName_pinsTheOpenAiPrefixRule() {
+        // The name inference is a separate method precisely so it stays testable independently of
+        // the override that can replace it; called directly here, not through isReasoningModel,
+        // so no capability property can mask a change to the rule itself.
+        for (final String model : new String[] { "o1", "o1-preview", "o1-mini", "o3", "o3-mini", "o4-mini", "gpt-5", "gpt-5-nano",
+                "gpt-5-mini" }) {
+            assertTrue("'" + model + "' must match the OpenAI reasoning-family prefix rule", OpenAiLlmClient.isReasoningModelName(model));
+        }
+        for (final String model : new String[] { "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo", "my-azure-deployment", "qwen3-32b", "",
+                "   " }) {
+            assertFalse("'" + model + "' must not match the OpenAI reasoning-family prefix rule",
+                    OpenAiLlmClient.isReasoningModelName(model));
+        }
+        assertFalse("a null model name must not match", OpenAiLlmClient.isReasoningModelName(null));
+    }
+
+    @Test
+    public void test_capabilityPredicates_readTheirOwnConfigKey() {
+        // Guards against a copy-paste of the wrong CONFIG_* constant into a predicate: each one
+        // must consult exactly its own suffix. A mis-wired predicate would still pass the
+        // forced-true/false tests below if two predicates shared a key.
+        final List<String> queried = new ArrayList<>();
+        final OpenAiLlmClient probe = new OpenAiLlmClient() {
+            @Override
+            protected String getConfigString(final String keySuffix, final String defaultValue) {
+                queried.add(keySuffix);
+                return defaultValue;
+            }
+        };
+
+        // The exact lookup sequence, not a subset: a predicate that consults its own key and then
+        // a foreign one would satisfy a contains() assertion while reading a key it has no
+        // business reading. Each dependent predicate reads its own suffix first and, still on
+        // auto, falls through to reasoning.model.enabled via its inference supplier.
+        queried.clear();
+        probe.isReasoningModel("gpt-4o");
+        assertEquals("isReasoningModel must read reasoning.model.enabled and nothing else", List.of("reasoning.model.enabled"), queried);
+
+        queried.clear();
+        probe.supportsTemperature("gpt-4o");
+        assertEquals("supportsTemperature must read temperature.enabled then reasoning.model.enabled",
+                List.of("temperature.enabled", "reasoning.model.enabled"), queried);
+
+        queried.clear();
+        probe.supportsSamplingParams("gpt-4o");
+        assertEquals("supportsSamplingParams must read sampling.params.enabled then reasoning.model.enabled",
+                List.of("sampling.params.enabled", "reasoning.model.enabled"), queried);
+
+        queried.clear();
+        probe.useMaxCompletionTokens("gpt-4o");
+        assertEquals("useMaxCompletionTokens must read max.completion.tokens.enabled then reasoning.model.enabled",
+                List.of("max.completion.tokens.enabled", "reasoning.model.enabled"), queried);
+
+        queried.clear();
+        probe.supportsReasoningEffort("gpt-4o");
+        assertEquals("supportsReasoningEffort must read reasoning.effort.enabled then reasoning.model.enabled",
+                List.of("reasoning.effort.enabled", "reasoning.model.enabled"), queried);
+    }
+
+    @Test
+    public void test_capabilityPredicates_forcedOverrideSkipsTheInferenceLookup() {
+        // resolveCapability's inference argument is a BooleanSupplier specifically so a forced
+        // override short-circuits before the inference runs its own config lookup. Replacing the
+        // supplier with an eagerly-computed boolean would still pass every other test in this
+        // class -- isReasoningModel's default (auto) inference for "gpt-4o" is false anyway -- so
+        // this pins the laziness directly: forcing temperature.enabled=false must record only
+        // "temperature.enabled" and must NOT record "reasoning.model.enabled", which the (unforced)
+        // supportsTemperature inference (!isReasoningModel(model)) would read if it ran eagerly.
+        final List<String> queried = new ArrayList<>();
+        final OpenAiLlmClient probe = new OpenAiLlmClient() {
+            @Override
+            protected String getConfigString(final String keySuffix, final String defaultValue) {
+                queried.add(keySuffix);
+                return "temperature.enabled".equals(keySuffix) ? "false" : defaultValue;
+            }
+        };
+
+        probe.supportsTemperature("gpt-4o");
+
+        assertTrue("the override itself must still be consulted, queried=" + queried, queried.contains("temperature.enabled"));
+        assertFalse("a forced override must short-circuit before the inference supplier runs, queried=" + queried,
+                queried.contains("reasoning.model.enabled"));
+    }
+
+    @Test
+    public void test_supportsReasoningEffort_defaultsToReasoningFamily() {
+        assertTrue(client.supportsReasoningEffort("gpt-5-nano"));
+        assertTrue(client.supportsReasoningEffort("o3-mini"));
+        assertFalse(client.supportsReasoningEffort("gpt-4o"));
+        assertFalse(client.supportsReasoningEffort("my-azure-deployment"));
+        assertFalse(client.supportsReasoningEffort(""));
+    }
+
+    @Test
+    public void test_isReasoningModel_forcedOnForNonOpenAiName() {
+        // The issue's headline case: a reasoning model such as Qwen3 behind an OpenAI-compatible
+        // endpoint carries a name the prefix matcher cannot classify.
+        client.setTestConfig("reasoning.model.enabled", "true");
+        assertTrue(client.isReasoningModel("qwen3-32b"));
+        assertTrue(client.isReasoningModel(""));
+    }
+
+    @Test
+    public void test_isReasoningModel_forcedOffForAnOpenAiLookalikeName() {
+        // The inverse: a gateway route named "o3-router" that is not a reasoning model at all.
+        client.setTestConfig("reasoning.model.enabled", "false");
+        assertFalse(client.isReasoningModel("o3-router"));
+        assertFalse(client.isReasoningModel("gpt-5-mini"));
+    }
+
+    @Test
+    public void test_dependentPredicates_followForcedReasoningByDefault() {
+        // With only reasoning.model.enabled set -- the minimal configuration the issue proposes -- the
+        // other four keys stay on auto and derive from it, exactly as they do today.
+        client.setTestConfig("reasoning.model.enabled", "true");
+        assertTrue(client.useMaxCompletionTokens("qwen3-32b"));
+        assertFalse(client.supportsTemperature("qwen3-32b"));
+        assertFalse(client.supportsSamplingParams("qwen3-32b"));
+        assertTrue(client.supportsReasoningEffort("qwen3-32b"));
+    }
+
+    @Test
+    public void test_dependentPredicates_areIndependentlyOverridable() {
+        // Qwen3 on vLLM: a reasoning model that nevertheless accepts temperature and top_p, uses
+        // max_tokens, and has no OpenAI reasoning_effort field. One flag cannot express this.
+        client.setTestConfig("reasoning.model.enabled", "true");
+        client.setTestConfig("temperature.enabled", "true");
+        client.setTestConfig("sampling.params.enabled", "true");
+        client.setTestConfig("max.completion.tokens.enabled", "false");
+        client.setTestConfig("reasoning.effort.enabled", "false");
+
+        assertTrue(client.isReasoningModel("qwen3-32b"));
+        assertTrue(client.supportsTemperature("qwen3-32b"));
+        assertTrue(client.supportsSamplingParams("qwen3-32b"));
+        assertFalse(client.useMaxCompletionTokens("qwen3-32b"));
+        assertFalse(client.supportsReasoningEffort("qwen3-32b"));
+    }
+
+    @Test
+    public void test_dependentPredicates_overrideAppliesWithoutTouchingReasoning() {
+        // Forcing a dependent must not flip the family predicate itself: the token multiplier is
+        // gated on isReasoningModel and must stay off here.
+        client.setTestConfig("temperature.enabled", "false");
+        assertFalse(client.supportsTemperature("gpt-4o"));
+        assertFalse(client.isReasoningModel("gpt-4o"));
+        assertFalse(client.useMaxCompletionTokens("gpt-4o"));
     }
 
     @Test
@@ -2169,6 +2427,285 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertEquals("low", body.get("reasoning_effort"));
     }
 
+    @Test
+    public void test_buildRequestBody_reasoningEffortDroppedWarns() {
+        // Symmetric with the sampling params: the value came from an explicit
+        // rag.llm.openai.<promptType>.reasoning.effort setting, so dropping it in silence reads
+        // as "applied". Before this change the drop was silent.
+        client.setTestModel("gpt-4o");
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        request.putExtraParam("reasoning_effort", "high");
+
+        final ListAppender app = attachLogCapture();
+        try {
+            final Map<String, Object> body = client.buildRequestBody(request, false);
+            assertNull(body.get("reasoning_effort"), "reasoning_effort must not be sent to a non-reasoning model");
+            assertTrue("dropping reasoning_effort must WARN",
+                    app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                            .stream()
+                            .anyMatch(s -> s.contains("reasoning_effort is not supported by model") && s.contains("gpt-4o")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_buildRequestBody_reasoningEffortSentWhenSupportedDoesNotWarn() {
+        client.setTestModel("gpt-5-nano");
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        request.putExtraParam("reasoning_effort", "low");
+
+        final ListAppender app = attachLogCapture();
+        try {
+            final Map<String, Object> body = client.buildRequestBody(request, false);
+            assertEquals("low", body.get("reasoning_effort"));
+            assertTrue("a supported reasoning_effort must not WARN",
+                    app.messagesAt(org.apache.logging.log4j.Level.WARN)
+                            .stream()
+                            .noneMatch(s -> s.contains("reasoning_effort is not supported")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_buildRequestBody_reasoningEffortSuppressedByOverrideOnAReasoningModel() {
+        // vLLM case: keep the reasoning classification (for the token multiplier) but stop
+        // sending the OpenAI-only reasoning_effort field.
+        client.setTestModel("qwen3-32b");
+        client.setTestConfig("reasoning.model.enabled", "true");
+        client.setTestConfig("reasoning.effort.enabled", "false");
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        request.putExtraParam("reasoning_effort", "medium");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+        assertNull(body.get("reasoning_effort"), "reasoning_effort must be suppressed by the override");
+    }
+
+    @Test
+    public void test_buildRequestBody_reasoningEffortForcedOnForNonOpenAiName() {
+        client.setTestModel("my-gateway-route");
+        client.setTestConfig("reasoning.effort.enabled", "true");
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        request.putExtraParam("reasoning_effort", "high");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+        assertEquals("high", body.get("reasoning_effort"));
+    }
+
+    // ========== dropped-parameter WARNs: config key naming and deduplication ==========
+
+    /** Every parameter this client can drop, all set explicitly, as an operator's config would. */
+    private static LlmChatRequest requestWithEveryDroppableParam() {
+        return new LlmChatRequest().setTemperature(0.5)
+                .putExtraParam("top_p", "0.9")
+                .putExtraParam("frequency_penalty", "0.5")
+                .putExtraParam("presence_penalty", "0.25")
+                .putExtraParam("reasoning_effort", "high")
+                .addUserMessage("Hello");
+    }
+
+    /** The WARN lines this client emits for a parameter it suppressed. */
+    private static List<String> droppedParamWarns(final ListAppender app) {
+        return app.messagesAt(org.apache.logging.log4j.Level.WARN).stream().filter(s -> s.contains("was not sent")).toList();
+    }
+
+    @Test
+    public void test_droppedSamplingParamWarn_namesTheRealConfigKeySuffix() {
+        // The WARN interpolated the OpenAI wire field into the config-key slot, so it told
+        // operators to remove "rag.llm.openai.*.top_p" -- a key that does not exist and that a
+        // grep of fess_config.properties never finds. The three real suffixes replace the
+        // underscore with a dot, and the setting is per prompt type, never "*".
+        client.setTestModel("gpt-5-nano");
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        request.putExtraParam("top_p", "0.9");
+        request.putExtraParam("frequency_penalty", "0.5");
+        request.putExtraParam("presence_penalty", "0.25");
+
+        final ListAppender app = attachLogCapture();
+        try {
+            client.buildRequestBody(request, false);
+            final List<String> warns = droppedParamWarns(app);
+            assertEquals("one WARN per dropped sampling parameter, warns=" + warns, 3, warns.size());
+            for (final String suffix : new String[] { "top.p", "frequency.penalty", "presence.penalty" }) {
+                assertTrue("a WARN must name rag.llm.openai.<promptType>." + suffix + ", warns=" + warns,
+                        warns.stream().anyMatch(s -> s.contains("rag.llm.openai.<promptType>." + suffix)));
+            }
+            assertTrue("no WARN may name a config key that does not exist, warns=" + warns,
+                    warns.stream()
+                            .noneMatch(s -> s.contains("rag.llm.openai.*.") || s.contains("rag.llm.openai.<promptType>.top_p")
+                                    || s.contains("rag.llm.openai.<promptType>.frequency_penalty")
+                                    || s.contains("rag.llm.openai.<promptType>.presence_penalty")));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_droppedTemperatureWarn_namesTheRealConfigKeySuffix() {
+        client.setTestModel("gpt-5-nano");
+        final ListAppender app = attachLogCapture();
+        try {
+            final Map<String, Object> body =
+                    client.buildRequestBody(new LlmChatRequest().setTemperature(0.5).addUserMessage("Hello"), false);
+            assertNull(body.get("temperature"), "temperature must not be sent to a model that rejects it");
+            final List<String> warns = droppedParamWarns(app);
+            assertEquals("dropping an explicitly configured temperature must WARN, warns=" + warns, 1, warns.size());
+            assertTrue("the WARN must name the model and the real config key, warns=" + warns,
+                    warns.get(0).contains("temperature is not supported by model gpt-5-nano")
+                            && warns.get(0).contains("rag.llm.openai.<promptType>.temperature"));
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_autoAppliedTemperature_isDroppedWithoutAWarn() {
+        // The counterpart: the client's own per-prompt-type default is not an operator mistake,
+        // so applyDefaultParams withdraws it before buildRequestBody can report it.
+        client.setTestModel("gpt-5-nano");
+        final ListAppender app = attachLogCapture();
+        try {
+            final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+            client.applyDefaultParams(request, "answer");
+            final Map<String, Object> body = client.buildRequestBody(request, false);
+            assertNull(body.get("temperature"));
+            final List<String> warns = droppedParamWarns(app);
+            assertTrue("the client's own default must not be reported as a misconfiguration, warns=" + warns, warns.isEmpty());
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_droppedParamWarns_areEmittedOncePerParameterAndModel() {
+        // A single RAG search issues several LLM calls (intent, evaluation, optional query
+        // regeneration, answer), so an undeduplicated WARN costs a handful of lines per user
+        // search for as long as the misconfiguration lasts -- measured at one WARN per call.
+        // gpt-4o with all three capabilities forced off is the one configuration in which every
+        // droppable parameter is dropped at once.
+        client.setTestModel("gpt-4o");
+        client.setTestConfig("temperature.enabled", "false");
+        client.setTestConfig("sampling.params.enabled", "false");
+        client.setTestConfig("reasoning.effort.enabled", "false");
+
+        final ListAppender app = attachLogCapture();
+        try {
+            for (int i = 0; i < 100; i++) {
+                client.buildRequestBody(requestWithEveryDroppableParam(), false);
+            }
+            final List<String> warns = droppedParamWarns(app);
+            assertEquals("100 calls must report each dropped parameter once, warns=" + warns, 5, warns.size());
+            for (final String field : new String[] { "temperature", "top_p", "frequency_penalty", "presence_penalty",
+                    "reasoning_effort" }) {
+                assertEquals("exactly one WARN for " + field + ", warns=" + warns, 1,
+                        (int) warns.stream().filter(s -> s.startsWith("[LLM:OPENAI] " + field + " ")).count());
+            }
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    @Test
+    public void test_droppedParamWarns_repeatForANewlyResolvedModel() {
+        // Keyed by parameter alone, switching the model would silence the report for the new one.
+        client.setTestModel("gpt-4o");
+        client.setTestConfig("temperature.enabled", "false");
+        client.setTestConfig("sampling.params.enabled", "false");
+        client.setTestConfig("reasoning.effort.enabled", "false");
+
+        final ListAppender app = attachLogCapture();
+        try {
+            client.buildRequestBody(requestWithEveryDroppableParam(), false);
+            client.buildRequestBody(requestWithEveryDroppableParam(), false);
+            assertEquals("the same model must report once, warns=" + droppedParamWarns(app), 5, droppedParamWarns(app).size());
+
+            // Per-request model override: the same client instance, a different resolved model.
+            client.buildRequestBody(requestWithEveryDroppableParam().setModel("gpt-4.1"), false);
+            final List<String> warns = droppedParamWarns(app);
+            assertEquals("a second model must be reported afresh, warns=" + warns, 10, warns.size());
+            assertEquals("the new model must be named, warns=" + warns, 5,
+                    (int) warns.stream().filter(s -> s.contains("model gpt-4.1 ")).count());
+        } finally {
+            detachLogCapture(app);
+        }
+    }
+
+    // ========== applyDefaultParams: temperature withdrawal ==========
+
+    @Test
+    public void test_applyDefaultParams_withdrawsItsOwnTemperatureForAModelThatRejectsIt() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        client.applyDefaultParams(request, "answer");
+        assertNull(request.getTemperature(), "the auto-applied default must not survive for a model that rejects temperature");
+        // The rest of the method is untouched: the reasoning multiplier still applies.
+        assertEquals(Integer.valueOf(8192), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_keepsItsOwnTemperatureForAModelThatAcceptsIt() {
+        client.setTestModel("gpt-4o");
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        client.applyDefaultParams(request, "answer");
+        assertEquals(0.5, request.getTemperature());
+    }
+
+    @Test
+    public void test_applyDefaultParams_keepsAnExplicitTemperatureForAModelThatRejectsIt() {
+        // Withdrawing an operator's own rag.llm.openai.<promptType>.temperature here would
+        // suppress the WARN in buildRequestBody, which is the only signal that it was ignored.
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest().setTemperature(0.9).addUserMessage("Hello");
+        client.applyDefaultParams(request, "answer");
+        assertEquals(0.9, request.getTemperature());
+    }
+
+    @Test
+    public void test_applyDefaultParams_temperatureWithdrawalFollowsTheCapabilityOverride() {
+        // Forced on for a reasoning model: the default stays, as it does on any endpoint that
+        // accepts temperature.
+        client.setTestModel("qwen3-32b");
+        client.setTestConfig("reasoning.model.enabled", "true");
+        client.setTestConfig("temperature.enabled", "true");
+        final LlmChatRequest accepted = new LlmChatRequest().addUserMessage("Hello");
+        client.applyDefaultParams(accepted, "answer");
+        assertEquals(0.5, accepted.getTemperature());
+
+        // Forced off for a model the name inference would have allowed: the default is withdrawn.
+        client.setTestModel("gpt-4o");
+        client.setTestConfig("reasoning.model.enabled", "auto");
+        client.setTestConfig("temperature.enabled", "false");
+        final LlmChatRequest rejected = new LlmChatRequest().addUserMessage("Hello");
+        client.applyDefaultParams(rejected, "answer");
+        assertNull(rejected.getTemperature(), "temperature.enabled=false must withdraw the default too");
+    }
+
+    @Test
+    public void test_temperatureWithdrawal_leavesTheWireBodyByteIdentical() throws Exception {
+        // The withdrawal changes when temperature stops existing, never what is sent:
+        // buildRequestBody dropped it at the wire either way. Both the withdrawn-default path and
+        // the explicitly-configured path must serialize to exactly the bytes of a request that
+        // never carried a temperature at all.
+        client.setTestModel("gpt-5-mini");
+        final ObjectMapper mapper = new ObjectMapper().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+
+        final LlmChatRequest defaulted = new LlmChatRequest().addUserMessage("Hello");
+        client.applyDefaultParams(defaulted, "answer");
+        // 2048 (answer default) x 4 -- what applyDefaultParams left on the request above.
+        final LlmChatRequest explicit = new LlmChatRequest().setTemperature(0.5).setMaxTokens(8192).addUserMessage("Hello");
+        final LlmChatRequest never = new LlmChatRequest().setMaxTokens(8192).addUserMessage("Hello");
+
+        for (final boolean stream : new boolean[] { false, true }) {
+            // Two-argument assertEquals: an all-String three-argument call resolves to
+            // (message, expected, actual) and reads as if the message were the expected value.
+            final String expected = mapper.writeValueAsString(client.buildRequestBody(never, stream));
+            assertEquals(expected, mapper.writeValueAsString(client.buildRequestBody(defaulted, stream)));
+            assertEquals(expected, mapper.writeValueAsString(client.buildRequestBody(explicit, stream)));
+            assertFalse("stream=" + stream + " body must not carry temperature: " + expected, expected.contains("temperature"));
+        }
+    }
+
     // ========== buildRequestBody: temperature integration ==========
 
     @Test
@@ -2443,6 +2980,56 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertFalse(body2.containsKey("max_completion_tokens"));
     }
 
+    @Test
+    public void test_buildRequestBody_openAiCompatibleReasoningModelFullConfiguration() {
+        // The complete issue #20 scenario on one request body: Qwen3 behind vLLM is a reasoning
+        // model that accepts temperature and top_p, expects max_tokens, and has no
+        // reasoning_effort field. Asserting on the body rather than on the predicates is what
+        // pins the actual wire contract.
+        client.setTestModel("qwen3-32b");
+        client.setTestConfig("reasoning.model.enabled", "true");
+        client.setTestConfig("temperature.enabled", "true");
+        client.setTestConfig("sampling.params.enabled", "true");
+        client.setTestConfig("max.completion.tokens.enabled", "false");
+        client.setTestConfig("reasoning.effort.enabled", "false");
+
+        final LlmChatRequest request = new LlmChatRequest().setTemperature(0.5).setMaxTokens(2048).addUserMessage("Hello");
+        request.putExtraParam("top_p", "0.9");
+        request.putExtraParam("frequency_penalty", "0.25");
+        request.putExtraParam("presence_penalty", "0.125");
+        request.putExtraParam("reasoning_effort", "low");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+
+        assertEquals("qwen3-32b", body.get("model"));
+        assertEquals(2048, body.get("max_tokens"));
+        assertNull(body.get("max_completion_tokens"), "a compatible server expecting max_tokens must not also get max_completion_tokens");
+        assertEquals(0.5, body.get("temperature"));
+        assertEquals(0.9, body.get("top_p"));
+        assertEquals(0.25, body.get("frequency_penalty"));
+        assertEquals(0.125, body.get("presence_penalty"));
+        assertNull(body.get("reasoning_effort"), "reasoning_effort is OpenAI-only and must be suppressed here");
+    }
+
+    @Test
+    public void test_buildRequestBody_defaultConfigurationIsUnchangedForAReasoningModel() {
+        // The backward-compatibility gate at the body level: with every capability key unset the
+        // body is exactly what it was before the overrides existed.
+        client.setTestModel("gpt-5-nano");
+
+        final LlmChatRequest request = new LlmChatRequest().setTemperature(0.5).setMaxTokens(2048).addUserMessage("Hello");
+        request.putExtraParam("top_p", "0.9");
+        request.putExtraParam("reasoning_effort", "low");
+
+        final Map<String, Object> body = client.buildRequestBody(request, false);
+
+        assertEquals(2048, body.get("max_completion_tokens"));
+        assertNull(body.get("max_tokens"));
+        assertNull(body.get("temperature"));
+        assertNull(body.get("top_p"));
+        assertEquals("low", body.get("reasoning_effort"));
+    }
+
     // ========== applyDefaultParams tests ==========
 
     @Test
@@ -2669,6 +3256,87 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         client.applyDefaultParams(request, "faq");
         assertEquals(Integer.valueOf(4096), request.getMaxTokens());
         assertNull(request.getExtraParam("reasoning_effort"));
+    }
+
+    @Test
+    public void test_applyDefaultParams_usesRequestModelForTheReasoningBranch() {
+        // buildRequestBody has always preferred request.getModel(); applyDefaultParams read only
+        // the configured model, so the token multiplier could be chosen for a different model than
+        // the one the request was actually sent to.
+        client.setTestModel("gpt-4o");
+        final LlmChatRequest request = new LlmChatRequest().setModel("gpt-5-mini").addUserMessage("Hello");
+        client.applyDefaultParams(request, "answer");
+        // answer default is 2048; a reasoning model multiplies it by 4.
+        assertEquals(Integer.valueOf(8192), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_requestModelSuppressesTheReasoningBranch() {
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest().setModel("gpt-4o").addUserMessage("Hello");
+        client.applyDefaultParams(request, "answer");
+        assertEquals(Integer.valueOf(2048), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_requestModelSuppressesTheAutoReasoningEffort() {
+        // Same divergence as the multiplier test, but on the reasoning_effort default: "intent" is
+        // one of the six prompt types that receive the auto "low", so this assertion is falsifiable
+        // where the one in the max-tokens test above is not.
+        client.setTestModel("gpt-5-mini");
+        final LlmChatRequest request = new LlmChatRequest().setModel("gpt-4o").addUserMessage("Hello");
+        client.applyDefaultParams(request, "intent");
+        assertNull(request.getExtraParam("reasoning_effort"), "the request model is not a reasoning model");
+        assertEquals(Integer.valueOf(256), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_multiplierAppliesToForcedReasoningModel() {
+        client.setTestModel("qwen3-32b");
+        client.setTestConfig("reasoning.model.enabled", "true");
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        client.applyDefaultParams(request, "answer");
+        assertEquals(Integer.valueOf(8192), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_effortOverrideSuppressesTheAutoLow() {
+        // reasoning.model.enabled=true keeps the 4x budget; reasoning.effort.enabled=false stops the
+        // auto "low" that a server without the field would reject.
+        client.setTestModel("qwen3-32b");
+        client.setTestConfig("reasoning.model.enabled", "true");
+        client.setTestConfig("reasoning.effort.enabled", "false");
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        client.applyDefaultParams(request, "intent");
+        assertNull(request.getExtraParam("reasoning_effort"), "the auto low must be suppressed by the override");
+        // 256 (intent default) x 4 -- the multiplier is independent of the effort override.
+        assertEquals(Integer.valueOf(1024), request.getMaxTokens());
+    }
+
+    @Test
+    public void test_applyDefaultParams_effortOverrideAppliesTheAutoLowToANonOpenAiName() {
+        client.setTestModel("my-gateway-route");
+        client.setTestConfig("reasoning.effort.enabled", "true");
+        final LlmChatRequest request = new LlmChatRequest().addUserMessage("Hello");
+        client.applyDefaultParams(request, "intent");
+        assertEquals("low", request.getExtraParam("reasoning_effort"));
+        // reasoning.model.enabled is still auto and the name is not a reasoning name, so no multiplier.
+        assertEquals(Integer.valueOf(256), request.getMaxTokens());
+    }
+
+    // ========== resolveModel tests ==========
+
+    @Test
+    public void test_resolveModel_prefersRequestModel() {
+        client.setTestModel("gpt-4o");
+        assertEquals("gpt-5-mini", client.resolveModel(new LlmChatRequest().setModel("gpt-5-mini")));
+    }
+
+    @Test
+    public void test_resolveModel_fallsBackToConfiguredModel() {
+        client.setTestModel("gpt-4o");
+        assertEquals("gpt-4o", client.resolveModel(new LlmChatRequest()));
+        assertEquals("gpt-4o", client.resolveModel(new LlmChatRequest().setModel("  ")));
     }
 
     // ========== buildRequestBody: top_p, frequency_penalty, presence_penalty tests ==========
@@ -3622,6 +4290,18 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         protected boolean isStreamUsageEnabled() {
             final String v = testConfigOverrides.get("stream.include.usage");
             return v != null ? Boolean.parseBoolean(v) : super.isStreamUsageEnabled();
+        }
+
+        /**
+         * Config seam for the capability overrides. Returns the default directly rather than
+         * delegating to {@code super}, so no test depends on a FessConfig component being
+         * present in the container. The real getOrDefault channel is pinned separately by
+         * {@code OpenAiLlmClientCapabilityConfigTest}.
+         */
+        @Override
+        protected String getConfigString(final String keySuffix, final String defaultValue) {
+            final String v = testConfigOverrides.get(keySuffix);
+            return v != null ? v : defaultValue;
         }
 
         void setTestApiKey(final String apiKey) {
