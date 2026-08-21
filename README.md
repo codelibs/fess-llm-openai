@@ -62,6 +62,13 @@ table below, it is not read from `fess_config.properties`. The rest of the RAG c
 | `rag.llm.openai.intent.history.max.messages` | `8` | Maximum history messages passed to the intent prompt |
 | `rag.llm.openai.intent.history.max.chars` | `4000` | Maximum history characters passed to the intent prompt |
 
+> **Debug logging and the API key.** The key is sent as an `Authorization: Bearer` header.
+> Raising the log level from Admin > General (either **Log Level** or **LLM Log Level**) does
+> not log it. Starting Fess with `FESS_LOG_LEVEL=debug` does: that raises the root logger,
+> which turns on Apache HttpClient's request-header logging, and the key is written to
+> `logs/fess.log` in cleartext. Prefer the admin settings; if you do run whole-system debug,
+> treat that log as holding a live credential.
+
 ### Per-Prompt-Type Parameters
 
 You can configure these OpenAI request parameters for each prompt type; `reasoning.effort`
