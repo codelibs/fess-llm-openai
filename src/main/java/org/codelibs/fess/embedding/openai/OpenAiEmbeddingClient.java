@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.hc.client5.http.classic.methods.HttpGet;
@@ -59,8 +60,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * ({@code task_type}), this client has no mechanism to distinguish a document/passage
  * embedding call from a query embedding call: OpenAI's {@code /v1/embeddings} API takes no
  * such parameter, and its models are designed to be used symmetrically for both. {@link
- * #embedDocuments(List)} and {@link #embedQuery(List)} are therefore intentionally
- * behaviorally identical, both delegating to the same request/response handling.
+ * #embedDocuments(List)} and {@link #embedQuery(List)} therefore issue an identical request
+ * and share all request/response handling.
+ *
+ * <p>They differ in one respect, and it is about the text rather than the API: a query
+ * reaching {@link #embedQuery(List)} on the RAG path is a Fess query string built by the
+ * LLM's intent step, so its query syntax is stripped first (see
+ * {@link #toPlainQuery(String)}). Document text is embedded exactly as given.
  *
  * @see <a href="https://developers.openai.com/api/docs/guides/embeddings">OpenAI Embeddings API</a>
  */
@@ -138,6 +144,36 @@ public class OpenAiEmbeddingClient extends AbstractEmbeddingClient {
      * ({@link #estimateTokens(String)}) has headroom before the real, exact limit.
      */
     private static final long BATCH_TOKEN_BUDGET = (long) (MAX_BATCH_TOKENS_ESTIMATE * 0.95);
+
+    /**
+     * A {@code +} or {@code -} that begins a term. Mid-token both are ordinary characters
+     * ({@code text-embedding-3-small}, {@code C++}), so the match is anchored to the start
+     * of the string or to whitespace and the whitespace itself is preserved.
+     */
+    private static final Pattern QUERY_TERM_PREFIX = Pattern.compile("(^|\\s)[+\\-](?=\\S)");
+
+    /**
+     * A field restriction such as {@code title:}. The field name is a schema name rather than
+     * something the user asked about, so it is removed with its colon instead of being left
+     * behind as a term. Deliberately ASCII-only ({@code \w}), which is what Fess field names are.
+     */
+    private static final Pattern QUERY_FIELD_PREFIX = Pattern.compile("\\b\\w+:");
+
+    /**
+     * A boost ({@code ^2}) or fuzzy/proximity ({@code ~1}) marker together with its number.
+     * Removed as a unit: dropping only the {@code ^} of {@code "Fess"^2} would glue the boost
+     * factor onto the term and embed {@code Fess2}.
+     */
+    private static final Pattern QUERY_BOOST_OR_FUZZY = Pattern.compile("[\\^~]\\d*(?:\\.\\d+)?");
+
+    /** Grouping, phrase, range and wildcard markup, plus the two-character boolean operators. */
+    private static final Pattern QUERY_SYNTAX_CHARS = Pattern.compile("[\"()\\[\\]{}*?\\\\]|&&|\\|\\|");
+
+    /** Boolean and range keywords, which Lucene reads as operators rather than as terms. */
+    private static final Pattern QUERY_KEYWORDS = Pattern.compile("\\b(?:AND|OR|NOT|TO)\\b");
+
+    /** Collapses the gaps left where markup was removed. */
+    private static final Pattern WHITESPACE_RUN = Pattern.compile("\\s+");
 
     /**
      * Approximate characters-per-token for non-CJK text, per OpenAI's own rule of thumb
@@ -281,21 +317,76 @@ public class OpenAiEmbeddingClient extends AbstractEmbeddingClient {
     }
 
     /**
-     * Generates embedding vectors for the given texts.
+     * Generates embedding vectors for the given query texts, with Fess/Lucene query syntax
+     * removed first (see {@link #toPlainQuery(String)}).
      *
-     * <p>Delegated to identically by both {@link #embedDocuments(List)} and
-     * {@link #embedQuery(List)}: OpenAI's {@code /v1/embeddings} API has no
-     * document/query distinction mechanism (unlike {@code OllamaEmbeddingClient}'s
-     * prefixes or {@code GeminiEmbeddingClient}'s {@code task_type}), so there is
-     * nothing provider-specific to vary between the two call sites.
+     * <p>OpenAI's {@code /v1/embeddings} API has no document/query distinction mechanism
+     * (unlike {@code OllamaEmbeddingClient}'s prefixes or {@code GeminiEmbeddingClient}'s
+     * {@code task_type}), so the request itself is identical to {@link #embedDocuments(List)}.
+     * What differs is the text: a query arriving here on the RAG path is a Fess query string
+     * assembled by the intent step, and its operators are markup rather than words.
      *
-     * @param texts the texts to embed, in order
+     * @param texts the query texts to embed, in order
      * @return the list of vectors, one per input text, in the same order
      * @throws EmbeddingException if the provider call fails or returns an unusable response
      */
     @Override
     public List<float[]> embedQuery(final List<String> texts) {
-        return doEmbed(texts);
+        if (texts == null || texts.isEmpty()) {
+            return doEmbed(texts);
+        }
+        final List<String> plainTexts = new ArrayList<>(texts.size());
+        for (final String text : texts) {
+            final String plain = toPlainQuery(text);
+            if (logger.isDebugEnabled() && plain != null && !plain.equals(text)) {
+                logger.debug("[Embedding:OPENAI] Removed query syntax before embedding. from={}, to={}", text, plain);
+            }
+            plainTexts.add(plain);
+        }
+        return doEmbed(plainTexts);
+    }
+
+    /**
+     * Removes Fess/Lucene query syntax so what gets embedded is the terms the user asked about.
+     *
+     * <p>On the RAG path fess core embeds the query the LLM's intent step produced, and this
+     * plugin's own {@code intentDetectionPrompt} instructs that step to emit Fess syntax
+     * ({@code +required}, {@code (a OR b)}, {@code title:"x"^2}, quoted phrases). Those
+     * operators are not words: embedded verbatim they are noise in the vector, and the chunks
+     * chosen for the answer prompt are ranked against that vector.
+     *
+     * <p><b>Scope.</b> In fess 15.8.0 exactly two call sites reach {@code embedQuery}.
+     * {@code SemanticChunkSearcher#search} calls it only after its own {@code isPlainQuery()}
+     * returned true, and every construct removed here is one that
+     * {@code SemanticChunkSearcher.QUERY_SYNTAX_PATTERN} already rejects - so for that call site
+     * this method is the identity and the semantic branch embeds exactly what it embedded
+     * before. The behaviour therefore changes only on the other call site,
+     * {@code DefaultChatContentFetcher#resolveQueryVector}, which is the one that needs it.
+     *
+     * <p>A string that survives unchanged is returned as-is, whitespace included, so the
+     * identity above is exact rather than approximate. A string left empty by the removals -
+     * a query made only of operators - falls back to the original, because a blank input is
+     * rejected by the API and degrading to the previous behaviour beats failing the chat.
+     *
+     * @param text the query text, may be null
+     * @return the text with query syntax removed, or the original text if nothing was removed
+     *         or nothing would remain
+     */
+    protected String toPlainQuery(final String text) {
+        if (StringUtil.isBlank(text)) {
+            return text;
+        }
+        String work = QUERY_TERM_PREFIX.matcher(text).replaceAll("$1");
+        work = QUERY_FIELD_PREFIX.matcher(work).replaceAll(StringUtil.EMPTY);
+        work = QUERY_BOOST_OR_FUZZY.matcher(work).replaceAll(StringUtil.EMPTY);
+        // Replaced with a space, not with nothing: "(a)(b)" must not become the single term "ab".
+        work = QUERY_SYNTAX_CHARS.matcher(work).replaceAll(" ");
+        work = QUERY_KEYWORDS.matcher(work).replaceAll(StringUtil.EMPTY);
+        if (work.equals(text)) {
+            return text;
+        }
+        final String plain = WHITESPACE_RUN.matcher(work).replaceAll(" ").trim();
+        return plain.isEmpty() ? text : plain;
     }
 
     /**

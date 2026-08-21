@@ -116,8 +116,13 @@ dimension) to be set, independent of this plugin.
 
 Unlike the sibling Ollama (text prefixes) and Gemini (`task_type`) embedding clients, OpenAI's
 `/v1/embeddings` API has no document/query distinction mechanism, so `embedDocuments()` and
-`embedQuery()` on this client are intentionally identical, both delegating to the same
-request/response handling.
+`embedQuery()` on this client issue an identical request and share all request/response handling.
+
+They differ in what they send. `embedQuery()` strips Fess/Lucene query syntax - `+required`
+terms, `(a OR b)` groups, `title:"x"^2` field boosts, quoted phrases - before embedding, because
+on the RAG path the string it receives is a Fess query built by the LLM's intent step and those
+operators are markup rather than words. `embedDocuments()` strips nothing: document text is
+prose whose punctuation is content. A query left empty by the removals is embedded unchanged.
 
 #### Request batching
 
