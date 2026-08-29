@@ -15,9 +15,9 @@
  */
 package org.codelibs.fess.openai.util;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * Renders an OpenAI error response body as a single-line log diagnostic.
@@ -68,7 +68,7 @@ public final class OpenAiErrorBody {
                         + "," + ERROR_FIELD_PARAM + "=" + err.path(ERROR_FIELD_PARAM).asText("null") //
                         + "," + ERROR_FIELD_MESSAGE + "=" + err.path(ERROR_FIELD_MESSAGE).asText("null");
             }
-        } catch (final JsonProcessingException e) {
+        } catch (final JacksonException e) {
             // fall through to raw clip
         }
         final String trimmed = errorBody.trim();

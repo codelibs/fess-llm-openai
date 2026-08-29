@@ -51,8 +51,8 @@ import org.codelibs.fess.openai.util.OpenAiRetry;
 import org.codelibs.fess.util.ComponentUtil;
 import org.codelibs.fess.util.CredentialUrlUtil;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.JsonNode;
 
 /**
  * LLM client implementation for OpenAI API.
@@ -755,7 +755,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                                     // Continue reading even after done — usage chunk arrives next.
                                 }
                                 // Usage-only chunk has empty choices[]; size>0 guard above keeps callback silent.
-                            } catch (final JsonProcessingException e) {
+                            } catch (final JacksonException e) {
                                 logger.warn("[LLM:OPENAI] Failed to parse streaming response. line={}", line, e);
                             }
                         }

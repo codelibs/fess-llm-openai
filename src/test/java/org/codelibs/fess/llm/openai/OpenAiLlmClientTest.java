@@ -40,8 +40,9 @@ import org.codelibs.fess.unit.UnitFessTestCase;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.SerializationFeature;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.SerializationFeature;
 
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
@@ -2688,7 +2689,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         // the explicitly-configured path must serialize to exactly the bytes of a request that
         // never carried a temperature at all.
         client.setTestModel("gpt-5-mini");
-        final ObjectMapper mapper = new ObjectMapper().configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
+        final ObjectMapper mapper = JsonMapper.builder().enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS).build();
 
         final LlmChatRequest defaulted = new LlmChatRequest().addUserMessage("Hello");
         client.applyDefaultParams(defaulted, "answer");

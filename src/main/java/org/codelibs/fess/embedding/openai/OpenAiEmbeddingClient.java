@@ -42,8 +42,9 @@ import org.codelibs.fess.util.CredentialUrlUtil;
 import org.codelibs.fess.openai.util.OpenAiErrorBody;
 import org.codelibs.fess.openai.util.OpenAiRetry;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * Embedding client implementation for OpenAI's Embeddings API.
@@ -712,7 +713,7 @@ public class OpenAiEmbeddingClient extends AbstractEmbeddingClient {
         final JsonNode jsonNode;
         try {
             jsonNode = objectMapper.readTree(responseBody);
-        } catch (final IOException e) {
+        } catch (final JacksonException e) {
             throw new EmbeddingException("Failed to parse OpenAI embed response", e);
         }
         final JsonNode dataNode = jsonNode.path("data");
