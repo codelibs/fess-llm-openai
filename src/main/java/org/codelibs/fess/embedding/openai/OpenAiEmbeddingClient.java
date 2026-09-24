@@ -24,7 +24,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Pattern;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.hc.client5.http.classic.methods.HttpGet;
 import org.apache.hc.client5.http.classic.methods.HttpPost;
@@ -217,16 +216,8 @@ public class OpenAiEmbeddingClient extends AbstractEmbeddingClient {
     }
 
     /**
-     * Guards the one-shot ERROR emitted by {@link #isUserInfoApiUrlRefused(String)}. The
-     * availability check runs on a timer, so reporting the refusal on every pass would flood the
-     * log for as long as the misconfiguration lasts. Cleared again as soon as a check sees a URL
-     * without userinfo, so a re-broken configuration is reported afresh.
-     */
-    private final AtomicBoolean userInfoRefusalReported = new AtomicBoolean();
-
-    /**
      * Returns whether the configured {@code api.url} must be refused because its authority carries
-     * a userinfo credential, reporting the reason and the remedy at ERROR the first time.
+     * a userinfo credential, reporting the reason and the remedy at ERROR every time it is refused.
      *
      * <p>This <em>fails closed</em> - it reports the client unavailable rather than throwing.
      * {@link #checkAvailabilityNow()} is reached from {@code init()}, which the DI container runs
@@ -245,12 +236,9 @@ public class OpenAiEmbeddingClient extends AbstractEmbeddingClient {
      */
     private boolean isUserInfoApiUrlRefused(final String apiUrl) {
         if (!CredentialUrlUtil.hasUserInfo(apiUrl)) {
-            userInfoRefusalReported.set(false);
             return false;
         }
-        if (userInfoRefusalReported.compareAndSet(false, true)) {
-            logger.error("[Embedding:OPENAI] OpenAI is not available. {}", HttpRequestFactory.userInfoRejectedMessage(userInfoConfigKey()));
-        }
+        logger.error("[Embedding:OPENAI] OpenAI is not available. {}", HttpRequestFactory.userInfoRejectedMessage(userInfoConfigKey()));
         return true;
     }
 

@@ -22,10 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
@@ -81,33 +78,6 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     private static final String CONFIG_MAX_COMPLETION_TOKENS_ENABLED = "max.completion.tokens.enabled";
     /** Config key suffix forcing {@link #supportsReasoningEffort(String)}. */
     private static final String CONFIG_REASONING_EFFORT_ENABLED = "reasoning.effort.enabled";
-
-    /**
-     * Capability keys already reported as carrying an unrecognized value, held as
-     * {@code <keySuffix>=<value>} tokens. The capability predicates run on every request, so a
-     * single misconfiguration would otherwise WARN on every call for as long as it lasts. Mirrors
-     * the intent of the one-shot guard in {@link #isUserInfoApiUrlRefused(String)}.
-     */
-    private final Set<String> warnedCapabilityValues = ConcurrentHashMap.newKeySet();
-
-    /**
-     * Request parameters already reported as dropped because the resolved model does not accept
-     * them, held as {@code <field>@<model>} tokens.
-     *
-     * <p>Kept separate from {@link #warnedCapabilityValues} rather than sharing it under a key
-     * prefix: the two guard different things - an unrecognized <em>configuration value</em> versus
-     * a <em>wire parameter</em> that was suppressed. A second set says that in the declaration
-     * itself, where a shared set would rest on a prefix convention that a later edit can break
-     * without anything noticing.
-     *
-     * <p>Deduplication is needed for the same reason it is needed there: a single RAG search issues
-     * several LLM calls (intent, evaluation, optional query regeneration, answer), so an
-     * undeduplicated WARN costs several log lines per user search for as long as the
-     * misconfiguration lasts. The model is part of the key so a changed model reports afresh, and
-     * the set stays small: the model comes from configuration, never from user input
-     * ({@link LlmChatRequest#setModel(String)} has no caller in Fess core).
-     */
-    private final Set<String> warnedDroppedParams = ConcurrentHashMap.newKeySet();
 
     /**
      * Default constructor.
@@ -326,16 +296,8 @@ public class OpenAiLlmClient extends AbstractLlmClient {
     }
 
     /**
-     * Guards the one-shot ERROR emitted by {@link #isUserInfoApiUrlRefused(String)}. The
-     * availability check runs on a timer, so reporting the refusal on every pass would flood the
-     * log for as long as the misconfiguration lasts. Cleared again as soon as a check sees a URL
-     * without userinfo, so a re-broken configuration is reported afresh.
-     */
-    private final AtomicBoolean userInfoRefusalReported = new AtomicBoolean();
-
-    /**
      * Returns whether the configured {@code api.url} must be refused because its authority carries
-     * a userinfo credential, reporting the reason and the remedy at ERROR the first time.
+     * a userinfo credential, reporting the reason and the remedy at ERROR every time it is refused.
      *
      * <p>This <em>fails closed</em> - it reports the client unavailable rather than throwing.
      * {@link #checkAvailabilityNow()} is reached from {@code init()}, which the DI container runs
@@ -355,12 +317,9 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      */
     private boolean isUserInfoApiUrlRefused(final String apiUrl) {
         if (!CredentialUrlUtil.hasUserInfo(apiUrl)) {
-            userInfoRefusalReported.set(false);
             return false;
         }
-        if (userInfoRefusalReported.compareAndSet(false, true)) {
-            logger.error("[LLM:OPENAI] OpenAI is not available. {}", HttpRequestFactory.userInfoRejectedMessage(userInfoConfigKey()));
-        }
+        logger.error("[LLM:OPENAI] OpenAI is not available. {}", HttpRequestFactory.userInfoRejectedMessage(userInfoConfigKey()));
         return true;
     }
 
@@ -848,7 +807,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         if (request.getTemperature() != null) {
             if (supportsTemperature(model)) {
                 body.put("temperature", request.getTemperature());
-            } else if (shouldWarnDroppedParam("temperature", model)) {
+            } else {
                 // Same reasoning as putDoubleParam and reasoning_effort below: only an explicit
                 // rag.llm.openai.<promptType>.temperature setting can still reach this branch,
                 // because applyDefaultParams clears its own auto-applied default for a model that
@@ -868,7 +827,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         if (reasoningEffort != null) {
             if (supportsReasoningEffort(model)) {
                 body.put("reasoning_effort", reasoningEffort);
-            } else if (shouldWarnDroppedParam("reasoning_effort", model)) {
+            } else {
                 // Symmetric with putDoubleParam: the value came from an explicit
                 // rag.llm.openai.<promptType>.reasoning.effort setting, and a silent drop reads as
                 // "applied". applyDefaultParams gates its auto-applied "low" on the same predicate,
@@ -913,10 +872,8 @@ public class OpenAiLlmClient extends AbstractLlmClient {
             // configured as top.p, frequency_penalty as frequency.penalty and presence_penalty as
             // presence.penalty - so the wire name must not be printed in the key position: an
             // operator who greps their configuration for it finds nothing.
-            if (shouldWarnDroppedParam(name, model)) {
-                logger.warn("[LLM:OPENAI] {} is not supported by model {} and was not sent. Remove the "
-                        + "{}.<promptType>.{} setting for this model.", name, model, getConfigPrefix(), name.replace('_', '.'));
-            }
+            logger.warn("[LLM:OPENAI] {} is not supported by model {} and was not sent. Remove the "
+                    + "{}.<promptType>.{} setting for this model.", name, model, getConfigPrefix(), name.replace('_', '.'));
             return;
         }
         try {
@@ -924,18 +881,6 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         } catch (final NumberFormatException e) {
             logger.warn("[LLM:OPENAI] Invalid {} value: {}", name, value);
         }
-    }
-
-    /**
-     * Returns whether a "parameter was not sent" WARN still has to be emitted for this parameter
-     * and model, recording the pair when it has.
-     *
-     * @param field the OpenAI request-body field that was dropped.
-     * @param model the resolved model name the drop was decided against.
-     * @return true the first time this parameter is dropped for this model, false afterwards.
-     */
-    private boolean shouldWarnDroppedParam(final String field, final String model) {
-        return warnedDroppedParams.add(field + "@" + model);
     }
 
     /**
@@ -1081,17 +1026,15 @@ public class OpenAiLlmClient extends AbstractLlmClient {
      * <p>A blank value is treated as {@code auto} in silence - {@code key=} in a properties file
      * reads as "left in place but unset". Any other unrecognized value degrades to {@code auto}
      * rather than to {@code false}, so a typo cannot silently switch a capability off, and is
-     * reported once per distinct key/value pair.
+     * reported at WARN every time it is read.
      *
      * <p>{@link org.codelibs.fess.embedding.openai.OpenAiEmbeddingClient#supportsDimensionsParam(String)}
      * is the sibling implementation of the same {@code auto} / {@code true} / {@code false} pattern
-     * in this plugin, and this method deliberately diverges from it twice. It WARNs on a blank
-     * value, where this method takes blank as a silent {@code auto}: {@code key=} in a properties
-     * file reads as "left in place but unset", not as a typo, so it is not worth a log line. And it
-     * WARNs on every call, where this method deduplicates per key/value pair: these predicates run
-     * on every request, so an undeduplicated WARN would flood the log for as long as the
-     * misconfiguration lasts. Neither divergence is accidental; do not "align" them by copying the
-     * embedding client's behavior here.
+     * in this plugin, and this method deliberately diverges from it on a blank value: it WARNs,
+     * where this method takes blank as a silent {@code auto}. {@code key=} in a properties file
+     * reads as "left in place but unset", not as a typo, so it is not worth a log line. The
+     * divergence is not accidental; do not "align" it by copying the embedding client's behavior
+     * here.
      *
      * @param keySuffix the capability key suffix under {@link #getConfigPrefix()}.
      * @return {@link Boolean#TRUE} or {@link Boolean#FALSE} when the capability is forced,
@@ -1108,9 +1051,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
         if (StringUtil.isBlank(value) || Constants.AUTO.equalsIgnoreCase(value)) {
             return null;
         }
-        if (warnedCapabilityValues.add(keySuffix + "=" + value)) {
-            logger.warn("[LLM:OPENAI] Invalid {}.{} value: {}. Using {}.", getConfigPrefix(), keySuffix, value, Constants.AUTO);
-        }
+        logger.warn("[LLM:OPENAI] Invalid {}.{} value: {}. Using {}.", getConfigPrefix(), keySuffix, value, Constants.AUTO);
         return null;
     }
 

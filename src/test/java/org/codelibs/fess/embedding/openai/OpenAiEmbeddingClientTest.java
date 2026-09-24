@@ -1204,9 +1204,9 @@ public class OpenAiEmbeddingClientTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_isAvailable_userInfoApiUrlErrorIsLoggedOnce() {
-        // checkAvailabilityNow() runs on a timer in production, so an ERROR per call would flood
-        // the log for as long as the misconfiguration lasts.
+    public void test_isAvailable_userInfoApiUrlErrorIsLoggedOnEveryCheck() {
+        // No latch: a refusal suppressed after the first report would stay silent if the
+        // misconfiguration came back later, so every availability check states the remedy.
         client.setTestApiUrl(USERINFO_API_URL);
         client.setTestApiKey("sk-test-key");
         client.setTestTimeout(30000);
@@ -1215,7 +1215,7 @@ public class OpenAiEmbeddingClientTest extends UnitFessTestCase {
             assertFalse(client.isAvailable());
             assertFalse(client.isAvailable());
             assertFalse(client.isAvailable());
-            assertEquals("the remedy must be stated once, not on every availability check", 1, app.messagesAt(Level.ERROR).size());
+            assertEquals("the remedy must be stated on every availability check", 3, app.messagesAt(Level.ERROR).size());
         } finally {
             detachLogCapture(app);
         }

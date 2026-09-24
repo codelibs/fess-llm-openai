@@ -206,10 +206,9 @@ WARN [LLM:OPENAI] top_p is not supported by model gpt-5-mini and was not sent.
 
 The warning names the OpenAI field, the resolved model, and the configuration key to edit - note
 that the key spells the field with dots (`top.p`, `frequency.penalty`, `presence.penalty`), so grep
-for that form rather than for the wire name. It is emitted **once per parameter and model**, not
-once per request: one RAG search issues several LLM calls, so repeating it would cost several log
-lines per user search for as long as the misconfiguration lasts. Changing the model reports the
-drop afresh.
+for that form rather than for the wire name. It is emitted on **every request** that drops the
+parameter, so it keeps appearing for as long as the setting is in place - and one RAG search issues
+several LLM calls, so expect several lines per search until the setting is removed.
 
 Only a value *you* configured is reported. The client's own per-prompt-type default `temperature`
 is withdrawn quietly when the model does not accept temperature, because that is the client's
