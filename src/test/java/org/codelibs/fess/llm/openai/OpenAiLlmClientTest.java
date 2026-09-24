@@ -316,9 +316,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_getCapabilityOverride_unrecognizedDegradesToAutoAndWarnsOnce() {
-        // Degrades to auto, not to false: a typo must not silently disable a capability. The
-        // predicates run on every request, so the WARN is deduplicated per key/value.
+    public void test_getCapabilityOverride_unrecognizedDegradesToAutoAndWarnsEveryTime() {
+        // Degrades to auto, not to false: a typo must not silently disable a capability. No
+        // latch: the WARN repeats on every read for as long as the value is in place.
         client.setTestConfig("reasoning.model.enabled", "ture");
         final ListAppender app = attachLogCapture();
         try {
@@ -329,7 +329,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
                     .stream()
                     .filter(s -> s.contains("rag.llm.openai.reasoning.model.enabled") && s.contains("ture"))
                     .toList();
-            assertEquals("an unrecognized value must WARN exactly once", 1, warns.size());
+            assertEquals("an unrecognized value must WARN on every read", 3, warns.size());
         } finally {
             detachLogCapture(app);
         }
@@ -354,11 +354,8 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_getCapabilityOverride_dedupIsKeyedByKeyAndValueNotByValueAlone() {
-        // The dedup token is "<keySuffix>=<value>". Keyed by the value alone, the same typo under
-        // a second key would be swallowed and that misconfiguration would never be reported --
-        // and every other test here would stay green, because they all vary the value under one
-        // key. So this varies the key under one value.
+    public void test_getCapabilityOverride_sameBadValueUnderTwoKeysNamesEachKey() {
+        // The same typo under two keys must be reported under each key's own name.
         final ListAppender app = attachLogCapture();
         try {
             client.setTestConfig("reasoning.model.enabled", "ture");
@@ -367,7 +364,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             client.getCapabilityOverride("temperature.enabled");
             final java.util.List<String> warns =
                     app.messagesAt(org.apache.logging.log4j.Level.WARN).stream().filter(s -> s.contains("value: ture")).toList();
-            assertEquals("the same bad value under two keys must be reported once per key, warns=" + warns, 2, warns.size());
+            assertEquals("the same bad value under two keys must be reported for each key, warns=" + warns, 2, warns.size());
             assertTrue("reasoning.model.enabled must be named by its own WARN, warns=" + warns,
                     warns.stream().anyMatch(s -> s.contains("rag.llm.openai.reasoning.model.enabled")));
             assertTrue("temperature.enabled must be named by its own WARN, warns=" + warns,
@@ -2494,7 +2491,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertEquals("high", body.get("reasoning_effort"));
     }
 
-    // ========== dropped-parameter WARNs: config key naming and deduplication ==========
+    // ========== dropped-parameter WARNs: config key naming and repetition ==========
 
     /** Every parameter this client can drop, all set explicitly, as an operator's config would. */
     private static LlmChatRequest requestWithEveryDroppableParam() {
@@ -2579,10 +2576,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_droppedParamWarns_areEmittedOncePerParameterAndModel() {
-        // A single RAG search issues several LLM calls (intent, evaluation, optional query
-        // regeneration, answer), so an undeduplicated WARN costs a handful of lines per user
-        // search for as long as the misconfiguration lasts -- measured at one WARN per call.
+    public void test_droppedParamWarns_areEmittedOnEveryRequest() {
+        // No latch: a drop reported only the first time would stay silent if the setting were
+        // removed and later put back, so every request that drops a parameter reports it.
         // gpt-4o with all three capabilities forced off is the one configuration in which every
         // droppable parameter is dropped at once.
         client.setTestModel("gpt-4o");
@@ -2592,14 +2588,14 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
 
         final ListAppender app = attachLogCapture();
         try {
-            for (int i = 0; i < 100; i++) {
+            for (int i = 0; i < 3; i++) {
                 client.buildRequestBody(requestWithEveryDroppableParam(), false);
             }
             final List<String> warns = droppedParamWarns(app);
-            assertEquals("100 calls must report each dropped parameter once, warns=" + warns, 5, warns.size());
+            assertEquals("3 calls must report each dropped parameter every time, warns=" + warns, 15, warns.size());
             for (final String field : new String[] { "temperature", "top_p", "frequency_penalty", "presence_penalty",
                     "reasoning_effort" }) {
-                assertEquals("exactly one WARN for " + field + ", warns=" + warns, 1,
+                assertEquals("one WARN per call for " + field + ", warns=" + warns, 3,
                         (int) warns.stream().filter(s -> s.startsWith("[LLM:OPENAI] " + field + " ")).count());
             }
         } finally {
@@ -2608,8 +2604,8 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_droppedParamWarns_repeatForANewlyResolvedModel() {
-        // Keyed by parameter alone, switching the model would silence the report for the new one.
+    public void test_droppedParamWarns_nameTheNewlyResolvedModel() {
+        // A per-request model override must be named in its own WARNs.
         client.setTestModel("gpt-4o");
         client.setTestConfig("temperature.enabled", "false");
         client.setTestConfig("sampling.params.enabled", "false");
@@ -2619,12 +2615,12 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         try {
             client.buildRequestBody(requestWithEveryDroppableParam(), false);
             client.buildRequestBody(requestWithEveryDroppableParam(), false);
-            assertEquals("the same model must report once, warns=" + droppedParamWarns(app), 5, droppedParamWarns(app).size());
+            assertEquals("the same model must report on every request, warns=" + droppedParamWarns(app), 10, droppedParamWarns(app).size());
 
             // Per-request model override: the same client instance, a different resolved model.
             client.buildRequestBody(requestWithEveryDroppableParam().setModel("gpt-4.1"), false);
             final List<String> warns = droppedParamWarns(app);
-            assertEquals("a second model must be reported afresh, warns=" + warns, 10, warns.size());
+            assertEquals("the other model must be reported too, warns=" + warns, 15, warns.size());
             assertEquals("the new model must be named, warns=" + warns, 5,
                     (int) warns.stream().filter(s -> s.contains("model gpt-4.1 ")).count());
         } finally {
@@ -3856,9 +3852,9 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
     }
 
     @Test
-    public void test_isAvailable_userInfoApiUrlErrorIsLoggedOnce() {
-        // checkAvailabilityNow() runs on a timer in production, so an ERROR per call would flood
-        // the log for as long as the misconfiguration lasts.
+    public void test_isAvailable_userInfoApiUrlErrorIsLoggedOnEveryCheck() {
+        // No latch: a refusal suppressed after the first report would stay silent if the
+        // misconfiguration came back later, so every availability check states the remedy.
         client.setTestApiUrl(USERINFO_API_URL);
         client.setTestApiKey("sk-test-key");
         final ListAppender app = attachLogCapture();
@@ -3866,7 +3862,7 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
             assertFalse(client.isAvailable());
             assertFalse(client.isAvailable());
             assertFalse(client.isAvailable());
-            assertEquals("the remedy must be stated once, not on every availability check", 1,
+            assertEquals("the remedy must be stated on every availability check", 3,
                     app.messagesAt(org.apache.logging.log4j.Level.ERROR).size());
         } finally {
             detachLogCapture(app);
