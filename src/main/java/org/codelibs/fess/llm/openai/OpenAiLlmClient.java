@@ -42,6 +42,7 @@ import org.codelibs.fess.llm.LlmChatResponse;
 import org.codelibs.fess.llm.LlmException;
 import org.codelibs.fess.llm.LlmMessage;
 import org.codelibs.fess.llm.LlmStreamCallback;
+import org.codelibs.fess.llm.LlmUsage;
 import org.codelibs.fess.openai.util.HttpRequestFactory;
 import org.codelibs.fess.openai.util.OpenAiErrorBody;
 import org.codelibs.fess.openai.util.OpenAiRetry;
@@ -629,6 +630,7 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                     Integer completionTokens = null;
                     Integer reasoningTokens = null;
                     Integer totalTokens = null;
+                    String lastModel = null;
                     boolean terminalCallbackSent = false;
 
                     try (BufferedReader reader =
@@ -667,6 +669,9 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                                 if (lastSystemFingerprint == null && jsonNode.has("system_fingerprint")
                                         && !jsonNode.get("system_fingerprint").isNull()) {
                                     lastSystemFingerprint = jsonNode.get("system_fingerprint").asText();
+                                }
+                                if (jsonNode.hasNonNull("model") && !jsonNode.get("model").asText().isBlank()) {
+                                    lastModel = jsonNode.get("model").asText();
                                 }
                                 if (jsonNode.has("usage") && !jsonNode.get("usage").isNull()) {
                                     final JsonNode u = jsonNode.get("usage");
@@ -741,6 +746,12 @@ public class OpenAiLlmClient extends AbstractLlmClient {
                         streamSummaryConsumer.accept(new StreamSummary(chunkCount, objectCount, lastFinishReason, lastResponseId,
                                 lastSystemFingerprint, promptTokens, cachedTokens, completionTokens, reasoningTokens, totalTokens,
                                 firstChunkTime, elapsed));
+                    }
+                    // The usage chunk carries the totals of the whole call; without this the caller would count
+                    // the call but none of its tokens (the synchronous chat() reports them through its response).
+                    final LlmUsage usage = new LlmUsage(promptTokens, completionTokens, totalTokens, lastModel);
+                    if (!usage.isEmpty()) {
+                        callback.onUsage(usage);
                     }
                     return null;
                 }

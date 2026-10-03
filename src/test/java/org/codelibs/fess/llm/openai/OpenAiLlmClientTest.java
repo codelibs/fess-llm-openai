@@ -35,6 +35,7 @@ import org.codelibs.fess.llm.LlmChatResponse;
 import org.codelibs.fess.llm.LlmException;
 import org.codelibs.fess.llm.LlmMessage;
 import org.codelibs.fess.llm.LlmStreamCallback;
+import org.codelibs.fess.llm.LlmUsage;
 import org.codelibs.fess.openai.util.OpenAiRetry;
 import org.codelibs.fess.unit.UnitFessTestCase;
 import org.junit.jupiter.api.Test;
@@ -1588,6 +1589,59 @@ public class OpenAiLlmClientTest extends UnitFessTestCase {
         assertNull(s.promptTokens);
         assertNull(s.completionTokens);
         assertNull(s.totalTokens);
+    }
+
+    @Test
+    public void test_streamChat_reportsUsageOnceAfterTheLastChunk() throws Exception {
+        setupClientForMockServer();
+        final String body = "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-08-06\","
+                + "\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                + "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[],"
+                + "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n" + "data: [DONE]\n\n";
+        final List<String> events = new ArrayList<>();
+        final List<LlmUsage> usages = new ArrayList<>();
+        streamAndRecordUsage(body, events, usages);
+        assertEquals(List.of(new LlmUsage(3, 4, 7, "gpt-4o-2024-08-06")), usages);
+        // The totals belong to the finished call: they arrive after the final chunk, not before.
+        assertEquals(List.of("chunk", "chunk", "usage"), events);
+    }
+
+    @Test
+    public void test_streamChat_reportsOnlyWhatTheServerSent() throws Exception {
+        // A backend without stream usage still names the model; the counts stay unknown (null), not zero.
+        setupClientForMockServer();
+        client.setTestConfig("stream.include.usage", "false");
+        final String body = "data: {\"id\":\"chatcmpl-1\",\"model\":\"local-model\","
+                + "\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n" + "data: [DONE]\n\n";
+        final List<LlmUsage> usages = new ArrayList<>();
+        streamAndRecordUsage(body, new ArrayList<>(), usages);
+        assertEquals(List.of(new LlmUsage(null, null, null, "local-model")), usages);
+    }
+
+    @Test
+    public void test_streamChat_reportsNothingWhenTheServerSentNothing() throws Exception {
+        setupClientForMockServer();
+        client.setTestConfig("stream.include.usage", "false");
+        final List<LlmUsage> usages = new ArrayList<>();
+        streamAndRecordUsage(simpleStreamSseBody(), new ArrayList<>(), usages);
+        assertTrue(usages.isEmpty());
+    }
+
+    private void streamAndRecordUsage(final String body, final List<String> events, final List<LlmUsage> usages) {
+        mockServer.enqueue(new MockResponse().setResponseCode(200).addHeader("Content-Type", "text/event-stream").setBody(body));
+        client.streamChat(buildSimpleRequest(), new LlmStreamCallback() {
+            @Override
+            public void onChunk(final String content, final boolean done) {
+                events.add("chunk");
+            }
+
+            @Override
+            public void onUsage(final LlmUsage usage) {
+                events.add("usage");
+                usages.add(usage);
+            }
+        });
     }
 
     @Test
